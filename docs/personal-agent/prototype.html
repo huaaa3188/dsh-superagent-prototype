@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Project Aura 原型交互系统</title>
+  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+  <style>
+    /* 基础滚动条优化与动画过渡 */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 9999px; }
+    .fade-in { animation: fadeIn 0.25s ease-out forwards; }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+  </style>
+</head>
+<body class="bg-[var(--background)] text-[var(--foreground)] antialiased min-h-screen flex flex-col font-sans">
+
+  <!-- 顶部导航栏 -->
+  <header class="border-b border-[var(--border)] bg-[var(--card)] sticky top-0 z-30 px-6 py-3.5 flex flex-wrap items-center justify-between gap-4 shadow-sm">
+    <div class="flex items-center gap-3">
+      <div class="w-8 h-8 rounded-lg bg-[var(--primary)] text-[var(--primary-foreground)] flex items-center justify-center font-bold text-base shadow">
+        ⚡
+      </div>
+      <div>
+        <h1 class="font-bold text-base tracking-tight flex items-center gap-2">
+          Project Aura <span class="text-xs px-2 py-0.5 rounded-full bg-[var(--secondary)] text-[var(--secondary-foreground)] border border-[var(--border)] font-normal">交互原型 v1.0</span>
+        </h1>
+        <p class="text-xs text-[var(--muted-foreground)]">Super-agent (dsh) 架构 × Today.ai 伴侣体验</p>
+      </div>
+    </div>
+
+    <!-- 视图切换 Tab -->
+    <div class="flex items-center gap-1.5 bg-[var(--secondary)] p-1 rounded-xl border border-[var(--border)] text-xs font-medium">
+      <button onclick="switchTab('tg-view')" id="btn-tg-view" class="px-3.5 py-1.5 rounded-lg bg-[var(--card)] text-[var(--foreground)] shadow-sm transition-all flex items-center gap-1.5 font-semibold">
+        <span>📱</span> Telegram 交互流
+      </button>
+      <button onclick="switchTab('dashboard-view')" id="btn-dashboard-view" class="px-3.5 py-1.5 rounded-lg text-[var(--muted-foreground)] hover:text-[var(--foreground)] transition-all flex items-center gap-1.5">
+        <span>🗓️</span> Today.ai 仪表盘
+      </button>
+      <button onclick="switchTab('system-view')" id="btn-system-view" class="px-3.5 py-1.5 rounded-lg text-[var(--muted-foreground)] hover:text-[var(--foreground)] transition-all flex items-center gap-1.5">
+        <span>⚙️</span> 后台架构与沙箱
+      </button>
+    </div>
+
+    <div class="flex items-center gap-3 text-xs text-[var(--muted-foreground)]">
+      <div class="flex items-center gap-1.5">
+        <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+        <span>US-VPS 运行中</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- 主内容区 -->
+  <main class="flex-1 p-4 md:p-6 max-w-7xl mx-auto w-full">
+
+    <!-- TAB 1: Telegram 交互流原型 -->
+    <section id="tab-tg-view" class="fade-in block">
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+        
+        <!-- 左侧：说明与交互指导 -->
+        <div class="lg:col-span-4 space-y-4">
+          <div class="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-5 shadow-sm space-y-3">
+            <h3 class="font-semibold text-sm text-[var(--foreground)] flex items-center gap-2">
+              💡 交互设计契约 (Attention Budget)
+            </h3>
+            <p class="text-xs text-[var(--muted-foreground)] leading-relaxed">
+              这里演示了用户日常在手机或电脑端使用 Telegram 与 Agent 的核心交互流。你可以<strong>点击右侧模拟界面中的按钮</strong>测试真实反馈：
+            </p>
+            <ul class="text-xs space-y-2.5 text-[var(--muted-foreground)]">
+              <li class="flex items-start gap-2">
+                <span class="text-emerald-500 font-bold">1.</span>
+                <span><strong>08:00 AM 晨间简报</strong>：整合日程冲突、Top 3 杠杆待办与重要邮件，带一键确认。</span>
+              </li>
+              <li class="flex items-start gap-2">
+                <span class="text-blue-500 font-bold">2.</span>
+                <span><strong>异步长任务解耦</strong>：你发出深度研报请求，Router 立即发回执并释放对话，后台 Worker 独立执行后交付产物。</span>
+              </li>
+              <li class="flex items-start gap-2">
+                <span class="text-amber-500 font-bold">3.</span>
+                <span><strong>L3 权限审批</strong>：涉及对外发送邮件或修改生产数据时，弹出明确的审批卡片，一键核准。</span>
+              </li>
+            </ul>
+          </div>
+
+          <div class="bg-[var(--secondary)] border border-[var(--border)] rounded-2xl p-4 text-xs space-y-2">
+            <div class="font-medium text-[var(--foreground)] flex items-center justify-between">
+              <span>快捷测试操作</span>
+              <span class="text-[10px] text-[var(--muted-foreground)]">模拟触发</span>
+            </div>
+            <div class="grid grid-cols-2 gap-2 pt-1">
+              <button onclick="triggerSimulateMorning()" class="p-2 rounded-lg bg-[var(--card)] border border-[var(--border)] hover:bg-[var(--accent)] text-left transition-colors">
+                ☀️ 重放晨报
+              </button>
+              <button onclick="triggerSimulateTask()" class="p-2 rounded-lg bg-[var(--card)] border border-[var(--border)] hover:bg-[var(--accent)] text-left transition-colors">
+                🔍 发起深度研报
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 右侧：Telegram 真实模拟对话窗口 -->
+        <div class="lg:col-span-8 flex justify-center">
+          <div class="w-full max-w-2xl bg-[var(--card)] border border-[var(--border)] rounded-3xl shadow-xl overflow-hidden flex flex-col h-[750px]">
+            
+            <!-- Telegram 顶部 Header -->
+            <div class="px-5 py-3.5 border-b border-[var(--border)] bg-[var(--sidebar)] flex items-center justify-between">
+              <div class="flex items-center gap-3">
+                <div class="relative">
+                  <div class="w-10 h-10 rounded-full bg-indigo-600 text-white flex items-center justify-center font-bold text-sm shadow">
+                    AU
+                  </div>
+                  <span class="absolute bottom-0 right-0 w-3 h-3 rounded-full bg-emerald-500 border-2 border-[var(--card)]"></span>
+                </div>
+                <div>
+                  <div class="font-semibold text-sm flex items-center gap-1.5">
+                    Aura Personal Agent <span class="text-[11px] text-emerald-500 font-mono">bot</span>
+                  </div>
+                  <div class="text-[11px] text-[var(--muted-foreground)]">常驻在线 · 私人白名单授权</div>
+                </div>
+              </div>
+              <div class="text-xs text-[var(--muted-foreground)] flex items-center gap-2">
+                <span class="px-2 py-1 rounded bg-[var(--secondary)]">Topic: #General</span>
+              </div>
+            </div>
+
+            <!-- 消息流区域 -->
+            <div id="tg-chat-stream" class="flex-1 overflow-y-auto p-4 space-y-4 text-xs bg-[var(--background)]">
+              
+              <!-- 消息 1: 时间戳分割线 -->
+              <div class="text-center">
+                <span class="px-3 py-1 rounded-full bg-[var(--secondary)] text-[var(--muted-foreground)] text-[11px]">
+                  今天 08:00
+                </span>
+              </div>
+
+              <!-- 消息 2: 晨间简报卡片 (Morning Briefing) -->
+              <div class="flex items-start gap-2.5 max-w-[92%]">
+                <div class="w-7 h-7 rounded-full bg-indigo-600 text-white flex items-center justify-center text-xs font-bold shrink-0 mt-0.5">
+                  AU
+                </div>
+                <div class="space-y-2 w-full">
+                  <div class="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-4 shadow-sm space-y-3">
+                    <div class="flex items-center justify-between border-b border-[var(--border)] pb-2.5">
+                      <div class="font-semibold text-sm text-[var(--foreground)] flex items-center gap-1.5">
+                        <span>🌅</span> 今日晨间简报
+                      </div>
+                      <span class="text-[11px] text-[var(--muted-foreground)]">08:00 AM</span>
+                    </div>
+
+                    <!-- 今日日程 -->
+                    <div class="space-y-1.5">
+                      <div class="text-[11px] font-semibold text-[var(--muted-foreground)] uppercase tracking-wider">🗓️ 今日日程规划</div>
+                      <div class="space-y-1 pl-2 border-l-2 border-indigo-500">
+                        <div class="flex justify-between items-center text-xs">
+                          <span class="font-medium text-[var(--foreground)]">10:00 - 11:00 · 架构周会</span>
+                          <span class="text-[11px] text-[var(--muted-foreground)]">Google Meet</span>
+                        </div>
+                        <div class="flex justify-between items-center text-xs">
+                          <span class="font-medium text-[var(--foreground)]">14:30 - 16:00 · 深度编程/专注时段</span>
+                          <span class="text-[11px] text-emerald-500 font-mono">[已锁定日程]</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <!-- 核心待办 Top 3 -->
+                    <div class="space-y-1.5">
+                      <div class="text-[11px] font-semibold text-[var(--muted-foreground)] uppercase tracking-wider">🎯 核心杠杆待办 (Top 3)</div>
+                      <div class="space-y-1.5 text-xs text-[var(--foreground)]">
+                        <label class="flex items-center gap-2 cursor-pointer">
+                          <input type="checkbox" checked class="rounded border-[var(--border)] text-indigo-600">
+                          <span class="line-through text-[var(--muted-foreground)]">复查 VPS 上 Node 22 环境</span>
+                        </label>
+                        <label class="flex items-center gap-2 cursor-pointer">
+                          <input type="checkbox" class="rounded border-[var(--border)] text-indigo-600">
+                          <span>审查 2026 Agent 框架对比研报草稿</span>
+                        </label>
+                        <label class="flex items-center gap-2 cursor-pointer">
+                          <input type="checkbox" class="rounded border-[var(--border)] text-indigo-600">
+                          <span>给海外客户 Alex 回复确认邮件</span>
+                        </label>
+                      </div>
+                    </div>
+
+                    <!-- 外部雷达 -->
+                    <div class="p-2.5 rounded-xl bg-[var(--secondary)] text-xs space-y-1 text-[var(--foreground)]">
+                      <div class="font-medium text-[11px] flex items-center gap-1 text-[var(--primary)]">
+                        <span>⚡</span> 重要邮件雷达
+                      </div>
+                      <p class="text-[var(--muted-foreground)] leading-relaxed">
+                        收到 1 封来自 GitHub 的重要安全告警，已自动生成分析备忘，无需紧急停机。
+                      </p>
+                    </div>
+
+                    <!-- 底部内联交互按钮 -->
+                    <div class="pt-2 border-t border-[var(--border)] grid grid-cols-3 gap-1.5" id="briefing-actions">
+                      <button onclick="confirmBriefingSchedule(this)" class="px-2.5 py-1.5 rounded-lg bg-[var(--primary)] text-[var(--primary-foreground)] text-xs font-medium hover:opacity-90 transition-all text-center">
+                        ✓ 确认行程
+                      </button>
+                      <button onclick="addQuickTodo()" class="px-2.5 py-1.5 rounded-lg bg-[var(--secondary)] text-[var(--foreground)] border border-[var(--border)] text-xs font-medium hover:bg-[var(--accent)] transition-all text-center">
+                        + 补充待办
+                      </button>
+                      <button onclick="toggleDND(this)" class="px-2.5 py-1.5 rounded-lg bg-[var(--secondary)] text-[var(--foreground)] border border-[var(--border)] text-xs font-medium hover:bg-[var(--accent)] transition-all text-center">
+                        🔕 专注静音
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 消息 3: 用户发送长任务指令 -->
+              <div class="flex justify-end">
+                <div class="bg-indigo-600 text-white rounded-2xl rounded-br-none p-3.5 max-w-[85%] shadow-sm space-y-1">
+                  <p class="leading-relaxed">
+                    帮我深度调研 2026 年最新开源的自主 Agent 框架（重点对比 DeepSeek dsh 与主流方案），整理一份对比表，存入知识库。
+                  </p>
+                  <div class="text-[10px] text-indigo-200 text-right">09:12</div>
+                </div>
+              </div>
+
+              <!-- 消息 4: Router 立即下发异步回执 (静默不卡死) -->
+              <div class="flex items-start gap-2.5 max-w-[92%]">
+                <div class="w-7 h-7 rounded-full bg-indigo-600 text-white flex items-center justify-center text-xs font-bold shrink-0 mt-0.5">
+                  AU
+                </div>
+                <div class="space-y-1 w-full">
+                  <div id="async-receipt-card" class="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-3.5 shadow-sm space-y-2">
+                    <div class="flex items-center justify-between">
+                      <span class="font-medium text-xs text-[var(--foreground)] flex items-center gap-1.5">
+                        <span>⏳</span> 任务已受理并解耦
+                      </span>
+                      <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-blue-500/10 text-blue-500 font-semibold">Worker-02 并发中</span>
+                    </div>
+                    <p class="text-xs text-[var(--muted-foreground)] leading-relaxed">
+                      已将研报任务分派给独立的沙箱 <code>Research Worker</code>。预计耗时 <strong>8 分钟</strong>，此期间<strong>当前对话通道已就绪</strong>，你可继续吩咐其他事。
+                    </p>
+                    <div class="w-full bg-[var(--secondary)] rounded-full h-1.5 overflow-hidden">
+                      <div class="bg-indigo-500 h-1.5 rounded-full w-3/4 animate-pulse"></div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 消息 5: 8分钟后 Worker 交付成果 -->
+              <div class="flex items-start gap-2.5 max-w-[92%]">
+                <div class="w-7 h-7 rounded-full bg-indigo-600 text-white flex items-center justify-center text-xs font-bold shrink-0 mt-0.5">
+                  AU
+                </div>
+                <div class="space-y-1 w-full">
+                  <div class="bg-[var(--card)] border border-emerald-500/30 rounded-2xl p-4 shadow-sm space-y-2.5 bg-gradient-to-b from-[var(--card)] to-emerald-500/5">
+                    <div class="flex items-center justify-between border-b border-[var(--border)] pb-2">
+                      <span class="font-semibold text-xs text-[var(--foreground)] flex items-center gap-1.5">
+                        <span>📦</span> 任务交付：2026 开源 Agent 框架对比研报
+                      </span>
+                      <span class="text-[10px] text-emerald-500 font-mono font-semibold">耗时 6分42秒</span>
+                    </div>
+                    <p class="text-xs text-[var(--muted-foreground)] leading-relaxed">
+                      已完成 14 篇技术源爬取与架构对比。已自动生成格式化 Markdown 报告并存入云笔记：<br>
+                      📁 <code>~/knowledge/research/2026_agents_comparison.md</code>
+                    </p>
+                    <div class="p-2.5 rounded-lg bg-[var(--secondary)] text-xs space-y-1">
+                      <div class="font-medium text-[var(--foreground)]">💡 核心结论提炼：</div>
+                      <div class="text-[var(--muted-foreground)] leading-normal">
+                        DeepSeek Harness 凭借微内核插件机制与严格注意力预算领先；Worker 脑手分离已成为事实标准。
+                      </div>
+                    </div>
+                    <div class="pt-1 flex gap-2">
+                      <button onclick="previewReportModal()" class="px-3 py-1.5 rounded-lg bg-[var(--primary)] text-[var(--primary-foreground)] text-xs font-medium hover:opacity-90 transition-all">
+                        📖 打开报告摘要
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 消息 6: L3 审批卡片 (邮件草稿放行) -->
+              <div class="flex items-start gap-2.5 max-w-[92%]">
+                <div class="w-7 h-7 rounded-full bg-indigo-600 text-white flex items-center justify-center text-xs font-bold shrink-0 mt-0.5">
+                  AU
+                </div>
+                <div class="space-y-1 w-full">
+                  <div id="email-approval-card" class="bg-[var(--card)] border border-amber-500/30 rounded-2xl p-4 shadow-sm space-y-3">
+                    <div class="flex items-center justify-between border-b border-[var(--border)] pb-2">
+                      <span class="font-semibold text-xs text-[var(--foreground)] flex items-center gap-1.5">
+                        <span>✉️</span> 权限拦截：待审批邮件回复草稿 (L3)
+                      </span>
+                      <span class="text-[10px] px-2 py-0.5 rounded bg-amber-500/10 text-amber-500 font-semibold">需要授权</span>
+                    </div>
+                    <div class="text-xs space-y-1 text-[var(--muted-foreground)]">
+                      <div><strong>收件人</strong>：Alex (alex.invest@global.com)</div>
+                      <div><strong>主 题</strong>：Re: 关于 Project Aura 技术路线确认</div>
+                    </div>
+                    <div class="p-2.5 rounded-lg bg-[var(--secondary)] text-xs text-[var(--foreground)] italic border-l-2 border-amber-500">
+                      "Hi Alex, 我们已确认采用 Router-Worker 双层架构部署于 US VPS，预计下周提供演示版本..."
+                    </div>
+                    <!-- 操作按钮 -->
+                    <div class="grid grid-cols-3 gap-2 pt-1" id="email-action-btns">
+                      <button onclick="approveEmailSend(this)" class="px-2.5 py-1.5 rounded-lg bg-emerald-600 text-white text-xs font-medium hover:bg-emerald-700 transition-all text-center">
+                        ✓ 确认发送
+                      </button>
+                      <button onclick="editEmailDraft()" class="px-2.5 py-1.5 rounded-lg bg-[var(--secondary)] text-[var(--foreground)] border border-[var(--border)] text-xs font-medium hover:bg-[var(--accent)] text-center">
+                        ✏️ 修改草稿
+                      </button>
+                      <button onclick="rejectEmailSend(this)" class="px-2.5 py-1.5 rounded-lg bg-[var(--secondary)] text-[var(--muted-foreground)] hover:text-red-500 text-xs font-medium text-center">
+                        ❌ 忽略放弃
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+            </div>
+
+            <!-- 底部模拟输入框 -->
+            <div class="p-3 bg-[var(--card)] border-t border-[var(--border)] flex items-center gap-2">
+              <button class="p-2 text-[var(--muted-foreground)] hover:text-[var(--foreground)]">📎</button>
+              <input id="user-tg-input" type="text" placeholder="给 Aura 发送消息或语音..." class="flex-1 bg-[var(--secondary)] border border-[var(--border)] rounded-xl px-3.5 py-2 text-xs text-[var(--foreground)] focus:outline-none focus:ring-1 focus:ring-indigo-500">
+              <button onclick="handleUserSend()" class="p-2 bg-[var(--primary)] text-[var(--primary-foreground)] rounded-xl hover:opacity-90">
+                ➔
+              </button>
+            </div>
+
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- TAB 2: Today.ai 仪表盘视角 -->
+    <section id="tab-dashboard-view" class="fade-in hidden">
+      <div class="space-y-6">
+        
+        <!-- 欢迎卡片 -->
+        <div class="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-6 shadow-sm flex flex-wrap items-center justify-between gap-4">
+          <div>
+            <div class="text-xs text-[var(--muted-foreground)]">2026年11月3日 · 星期二</div>
+            <h2 class="text-xl font-bold text-[var(--foreground)] mt-1">早安，Runhua！今日精力充沛。</h2>
+            <p class="text-xs text-[var(--muted-foreground)] mt-1">Aura 已在后台为你处理 14 封无用通知，全天时间块已合理规划。</p>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="px-3 py-1.5 rounded-xl bg-indigo-500/10 text-indigo-500 text-xs font-medium border border-indigo-500/20">
+              🧠 Living Memory 正常演进中
+            </span>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+          
+          <!-- 左侧：今日日程与时间块 -->
+          <div class="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-5 shadow-sm space-y-4">
+            <div class="flex items-center justify-between">
+              <h3 class="font-semibold text-sm flex items-center gap-2">
+                <span>📅</span> 今日时间块 (Time-blocks)
+              </h3>
+              <span class="text-xs text-[var(--muted-foreground)]">Google Cal 同步</span>
+            </div>
+            <div class="space-y-3">
+              <div class="p-3 rounded-xl bg-[var(--secondary)] border-l-4 border-indigo-500 space-y-1">
+                <div class="text-[11px] text-[var(--muted-foreground)]">10:00 - 11:00 AM</div>
+                <div class="font-medium text-xs text-[var(--foreground)]">项目架构评审会议</div>
+              </div>
+              <div class="p-3 rounded-xl bg-[var(--secondary)] border-l-4 border-emerald-500 space-y-1">
+                <div class="text-[11px] text-[var(--muted-foreground)]">14:00 - 16:30 PM</div>
+                <div class="font-medium text-xs text-[var(--foreground)]">核心代码编写 (Deep Work)</div>
+                <div class="text-[11px] text-emerald-500">Agent 自动进入高优先级免打扰</div>
+              </div>
+              <div class="p-3 rounded-xl bg-[var(--secondary)] border-l-4 border-slate-400 space-y-1">
+                <div class="text-[11px] text-[var(--muted-foreground)]">17:00 - 17:30 PM</div>
+                <div class="font-medium text-xs text-[var(--foreground)]">日暮复盘与待办清点</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 中间：Living Memory 记忆库 -->
+          <div class="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-5 shadow-sm space-y-4">
+            <div class="flex items-center justify-between">
+              <h3 class="font-semibold text-sm flex items-center gap-2">
+                <span>🧬</span> 共生记忆 (Living Memory)
+              </h3>
+              <span class="text-[11px] text-indigo-500 font-mono">3 层解耦</span>
+            </div>
+            <div class="space-y-2.5 text-xs">
+              <div class="p-3 rounded-xl bg-[var(--secondary)] space-y-1">
+                <div class="font-medium text-[var(--foreground)] flex justify-between">
+                  <span>L1 核心画像 (Profile)</span>
+                  <span class="text-[10px] text-emerald-500">常驻</span>
+                </div>
+                <div class="text-[var(--muted-foreground)] leading-relaxed">
+                  · 周二下午禁止插会<br>
+                  · 沟通偏好：直接给结论与操作按钮<br>
+                  · 常用栈：Node 22 / Python / VPS
+                </div>
+              </div>
+              <div class="p-3 rounded-xl bg-[var(--secondary)] space-y-1">
+                <div class="font-medium text-[var(--foreground)] flex justify-between">
+                  <span>L2 活动项目 (Active State)</span>
+                  <span class="text-[10px] text-blue-500">动态更新</span>
+                </div>
+                <div class="text-[var(--muted-foreground)] leading-relaxed">
+                  · 重点项目：Project Aura 原型实现<br>
+                  · 追踪客户：Alex (下周提供 Demo)
+                </div>
+              </div>
+              <div class="p-3 rounded-xl bg-[var(--secondary)] space-y-1">
+                <div class="font-medium text-[var(--foreground)] flex justify-between">
+                  <span>L3 知识冷归档 (Archive)</span>
+                  <span class="text-[10px] text-[var(--muted-foreground)]">按需检索</span>
+                </div>
+                <div class="text-[var(--muted-foreground)] leading-relaxed">
+                  · 28 篇研报、43 份会议纪要已建立向量索引
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 右侧：注意力预算与准入过滤统计 -->
+          <div class="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-5 shadow-sm space-y-4">
+            <div class="flex items-center justify-between">
+              <h3 class="font-semibold text-sm flex items-center gap-2">
+                <span>🛡️</span> 注意力预算 (Attention Budget)
+              </h3>
+              <span class="text-xs text-emerald-500">健康度 98%</span>
+            </div>
+            <div class="space-y-4">
+              <div>
+                <div class="flex justify-between text-xs mb-1.5">
+                  <span class="text-[var(--muted-foreground)]">今日主动打扰次数</span>
+                  <span class="font-semibold text-[var(--foreground)]">2 / 5 次上限</span>
+                </div>
+                <div class="w-full bg-[var(--secondary)] rounded-full h-2">
+                  <div class="bg-indigo-600 h-2 rounded-full w-2/5"></div>
+                </div>
+              </div>
+
+              <div class="grid grid-cols-2 gap-3 pt-2 text-center">
+                <div class="p-3 rounded-xl bg-[var(--secondary)]">
+                  <div class="text-lg font-bold text-[var(--foreground)]">14</div>
+                  <div class="text-[11px] text-[var(--muted-foreground)] mt-0.5">拦截无意义杂音</div>
+                </div>
+                <div class="p-3 rounded-xl bg-[var(--secondary)]">
+                  <div class="text-lg font-bold text-emerald-500">100%</div>
+                  <div class="text-[11px] text-[var(--muted-foreground)] mt-0.5">授权指令合规率</div>
+                </div>
+              </div>
+
+              <div class="p-3 rounded-xl border border-indigo-500/20 bg-indigo-500/5 text-xs text-[var(--muted-foreground)] leading-relaxed">
+                <strong>Super-agent 契约生效中：</strong>除非成果交付或必须人类授权，全天保持静默巡检。
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 3: 后台架构与沙箱拓扑 -->
+    <section id="tab-system-view" class="fade-in hidden">
+      <div class="space-y-6">
+        
+        <div class="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-5 shadow-sm">
+          <h3 class="font-semibold text-sm text-[var(--foreground)] mb-1">
+            ⚙️ VPS 运行时沙箱拓扑 (DeepSeek Harness 微内核)
+          </h3>
+          <p class="text-xs text-[var(--muted-foreground)]">
+            展示前台 Router 与并发 Worker 在宿主机中的真实隔离状态，以及 Watchdog 自愈守护。
+          </p>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-12 gap-6">
+          
+          <!-- Router 节点状态 -->
+          <div class="md:col-span-5 bg-[var(--card)] border border-[var(--border)] rounded-2xl p-5 shadow-sm space-y-4">
+            <div class="flex items-center justify-between border-b border-[var(--border)] pb-3">
+              <div>
+                <div class="font-semibold text-sm text-[var(--foreground)]">Router 调度总线 (Brain)</div>
+                <div class="text-xs text-[var(--muted-foreground)]">轻量常驻进程 · PID: 12480</div>
+              </div>
+              <span class="px-2.5 py-1 rounded-full bg-emerald-500/10 text-emerald-500 text-xs font-medium">Active</span>
+            </div>
+            <div class="text-xs space-y-2 text-[var(--muted-foreground)]">
+              <div class="flex justify-between">
+                <span>运行环境:</span>
+                <span class="text-[var(--foreground)] font-mono">Node.js 22 LTS (US-VPS)</span>
+              </div>
+              <div class="flex justify-between">
+                <span>长轮询通道:</span>
+                <span class="text-[var(--foreground)] font-mono">Telegram Bot API (Direct)</span>
+              </div>
+              <div class="flex justify-between">
+                <span>准入过滤器:</span>
+                <span class="text-emerald-500 font-semibold">白名单生效 (1 User)</span>
+              </div>
+              <div class="flex justify-between">
+                <span>重型工具挂载:</span>
+                <span class="text-amber-500 font-semibold">未挂载 (安全隔离)</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Worker 隔离集群 -->
+          <div class="md:col-span-7 bg-[var(--card)] border border-[var(--border)] rounded-2xl p-5 shadow-sm space-y-4">
+            <div class="flex items-center justify-between border-b border-[var(--border)] pb-3">
+              <div>
+                <div class="font-semibold text-sm text-[var(--foreground)]">Worker 独立沙箱集群 (Hands)</div>
+                <div class="text-xs text-[var(--muted-foreground)]">tmux / 目录隔离 · 对人绝对静默</div>
+              </div>
+              <span class="text-xs text-[var(--muted-foreground)] font-mono">并发上限: 4</span>
+            </div>
+
+            <div class="space-y-3">
+              <!-- Worker 1 -->
+              <div class="p-3.5 rounded-xl bg-[var(--secondary)] flex items-center justify-between text-xs">
+                <div>
+                  <div class="font-medium text-[var(--foreground)] flex items-center gap-2">
+                    <span>Research Worker (沙箱-1)</span>
+                    <span class="px-2 py-0.5 rounded text-[10px] bg-blue-500/10 text-blue-500 font-mono">IDLE (已休眠)</span>
+                  </div>
+                  <div class="text-[11px] text-[var(--muted-foreground)] mt-0.5">目录: <code>/tmp/workers/task_res_01</code> · 挂载 Tavily & Playwright</div>
+                </div>
+                <span class="text-[11px] text-emerald-500">刚刚交付</span>
+              </div>
+
+              <!-- Worker 2 -->
+              <div class="p-3.5 rounded-xl bg-[var(--secondary)] flex items-center justify-between text-xs">
+                <div>
+                  <div class="font-medium text-[var(--foreground)] flex items-center gap-2">
+                    <span>Daily Briefing Worker</span>
+                    <span class="px-2 py-0.5 rounded text-[10px] bg-emerald-500/10 text-emerald-500 font-mono">STANDBY</span>
+                  </div>
+                  <div class="text-[11px] text-[var(--muted-foreground)] mt-0.5">定时 Cron: 07:30 AM · 挂载 Calendar & IMAP API</div>
+                </div>
+                <span class="text-[11px] text-[var(--muted-foreground)]">下次触发明早</span>
+              </div>
+
+              <!-- Worker 3 (Watchdog) -->
+              <div class="p-3.5 rounded-xl bg-[var(--secondary)] flex items-center justify-between text-xs border border-indigo-500/20">
+                <div>
+                  <div class="font-medium text-[var(--foreground)] flex items-center gap-2">
+                    <span>Watchdog 看门狗自愈守护</span>
+                    <span class="px-2 py-0.5 rounded text-[10px] bg-indigo-500/10 text-indigo-500 font-mono">ACTIVE</span>
+                  </div>
+                  <div class="text-[11px] text-[var(--muted-foreground)] mt-0.5">最大步数限制: 25 步 · 超时熔断: 15 分钟</div>
+                </div>
+                <span class="text-[11px] text-emerald-500">监控中</span>
+              </div>
+            </div>
+
+          </div>
+
+        </div>
+
+      </div>
+    </section>
+
+  </main>
+
+  <!-- 报告预览 Modal 弹窗 -->
+  <div id="report-modal" class="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4 hidden">
+    <div class="bg-[var(--card)] border border-[var(--border)] rounded-2xl max-w-2xl w-full p-6 shadow-2xl space-y-4 max-h-[85vh] flex flex-col">
+      <div class="flex items-center justify-between border-b border-[var(--border)] pb-3">
+        <h3 class="font-bold text-base text-[var(--foreground)] flex items-center gap-2">
+          <span>📄</span> 2026 开源 Agent 框架对比研报 (预览)
+        </h3>
+        <button onclick="closeReportModal()" class="text-[var(--muted-foreground)] hover:text-[var(--foreground)] text-lg">✕</button>
+      </div>
+      <div class="flex-1 overflow-y-auto text-xs space-y-3 text-[var(--muted-foreground)] leading-relaxed">
+        <p class="font-medium text-[var(--foreground)]">核心架构评估表：</p>
+        <div class="border border-[var(--border)] rounded-xl overflow-hidden">
+          <table class="w-full text-left border-collapse text-xs">
+            <thead class="bg-[var(--secondary)] text-[var(--foreground)] border-b border-[var(--border)]">
+              <tr>
+                <th class="p-2.5">框架名称</th>
+                <th class="p-2.5">架构特点</th>
+                <th class="p-2.5">注意力设计</th>
+                <th class="p-2.5">个人适用度</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-[var(--border)]">
+              <tr>
+                <td class="p-2.5 font-semibold text-[var(--foreground)]">DeepSeek dsh</td>
+                <td class="p-2.5">Cordis 微内核 + Router/Worker 解耦</td>
+                <td class="p-2.5 text-emerald-500">极高 (严格静默)</td>
+                <td class="p-2.5 font-bold">★★★★★</td>
+              </tr>
+              <tr>
+                <td class="p-2.5 font-semibold text-[var(--foreground)]">传统单会话框架</td>
+                <td class="p-2.5">单会话长 Prompt</td>
+                <td class="p-2.5 text-red-500">差 (会话阻塞刷屏)</td>
+                <td class="p-2.5">★★☆☆☆</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>完整研报已自动写入知识库，支持随时从本地 Obsidian 查看。</p>
+      </div>
+      <div class="pt-3 border-t border-[var(--border)] flex justify-end">
+        <button onclick="closeReportModal()" class="px-4 py-2 rounded-xl bg-[var(--primary)] text-[var(--primary-foreground)] text-xs font-medium">
+          关闭预览
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 交互逻辑脚本 -->
+  <script>
+    // Tab 切换逻辑
+    function switchTab(tabId) {
+      ['tg-view', 'dashboard-view', 'system-view'].forEach(id => {
+        const section = document.getElementById('tab-' + id);
+        const btn = document.getElementById('btn-' + id);
+        if (id === tabId) {
+          section.classList.remove('hidden');
+          section.classList.add('block');
+          btn.classList.add('bg-[var(--card)]', 'text-[var(--foreground)]', 'font-semibold', 'shadow-sm');
+          btn.classList.remove('text-[var(--muted-foreground)]');
+        } else {
+          section.classList.add('hidden');
+          section.classList.remove('block');
+          btn.classList.remove('bg-[var(--card)]', 'text-[var(--foreground)]', 'font-semibold', 'shadow-sm');
+          btn.classList.add('text-[var(--muted-foreground)]');
+        }
+      });
+    }
+
+    // 交互动作：确认今日日程
+    function confirmBriefingSchedule(btn) {
+      btn.innerText = '✓ 今日日程已锁死';
+      btn.classList.remove('bg-[var(--primary)]');
+      btn.classList.add('bg-emerald-600', 'text-white');
+      btn.disabled = true;
+      alert('【已确认日程】Agent 已自动锁定 14:30 专注时段，该期间开启免打扰过滤！');
+    }
+
+    // 交互动作：添加待办
+    function addQuickTodo() {
+      const todo = prompt('请输入你要补充的待办事项：', '阅读 DeepSeek 论文 000-philosophy.md');
+      if (todo) {
+        alert('【已记录】已由 Router 同步至今日待办清单，并计入日落复盘。');
+      }
+    }
+
+    // 交互动作：免打扰
+    function toggleDND(btn) {
+      if (btn.innerText.includes('静音')) {
+        btn.innerText = '🔔 恢复提醒';
+        btn.classList.add('border-indigo-500', 'text-indigo-500');
+        alert('【静音生效】未来 4 小时内，除 L3 级绝密安全审批外，一切消息保持静音。');
+      } else {
+        btn.innerText = '🔕 专注静音';
+        btn.classList.remove('border-indigo-500', 'text-indigo-500');
+      }
+    }
+
+    // 交互动作：审批邮件发送
+    function approveEmailSend(btn) {
+      const card = document.getElementById('email-approval-card');
+      const actionBtns = document.getElementById('email-action-btns');
+      actionBtns.innerHTML = `
+        <div class="col-span-3 text-center py-1.5 px-3 rounded-lg bg-emerald-500/10 text-emerald-500 text-xs font-semibold flex items-center justify-center gap-1.5">
+          <span>✓</span> 已通过 Gmail API 成功投递并抄送归档！
+        </div>
+      `;
+      card.classList.remove('border-amber-500/30');
+      card.classList.add('border-emerald-500/40');
+    }
+
+    // 交互动作：拒绝邮件
+    function rejectEmailSend(btn) {
+      const actionBtns = document.getElementById('email-action-btns');
+      actionBtns.innerHTML = `
+        <div class="col-span-3 text-center py-1.5 px-3 rounded-lg bg-[var(--secondary)] text-[var(--muted-foreground)] text-xs">
+          草稿已撤回并安全丢弃。
+        </div>
+      `;
+    }
+
+    function editEmailDraft() {
+      prompt('请输入修改意见：', '加上一句：下周二下午开会讨论');
+      alert('已转交 Worker 重新排版草稿。');
+    }
+
+    // 模态弹窗控制
+    function previewReportModal() {
+      document.getElementById('report-modal').classList.remove('hidden');
+    }
+    function closeReportModal() {
+      document.getElementById('report-modal').classList.add('hidden');
+    }
+
+    // 模拟重放晨报
+    function triggerSimulateMorning() {
+      alert('模拟触发 Cron 07:30：Daily Worker 正在拉取日程生成简报...');
+      switchTab('tg-view');
+    }
+
+    // 模拟发起研报任务
+    function triggerSimulateTask() {
+      document.getElementById('user-tg-input').value = '帮我对比目前主流的海外 VPS 服务商性价比...';
+      switchTab('tg-view');
+      document.getElementById('user-tg-input').focus();
+    }
+
+    // 模拟发送
+    function handleUserSend() {
+      const input = document.getElementById('user-tg-input');
+      if (!input.value.trim()) return;
+      alert(`已收到指令：\"${input.value}\"。\nRouter 判定为后台任务，已分配 Worker 独立执行！`);
+      input.value = '';
+    }
+  </script>
+</body>
+</html>

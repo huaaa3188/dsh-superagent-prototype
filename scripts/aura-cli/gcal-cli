@@ -1,0 +1,267 @@
+#!/usr/bin/env node
+/**
+ * gcal-cli: Controlled Calendar & GTD CLI for Project Aura (dsh-superagent).
+ *
+ * Permission Tiers:
+ *   L1 (Read-only):
+ *     gcal-cli list [--date YYYY-MM-DD]
+ *     gcal-cli conflicts [--date YYYY-MM-DD]
+ *     gcal-cli gtd-list [--status todo|done|all]
+ *   L2 (Reversible Drafts & GTD):
+ *     gcal-cli draft-add --title <text> --start <HH:MM> --end <HH:MM> [--date YYYY-MM-DD] [--location <loc>]
+ *     gcal-cli gtd-add --title <text> [--priority high|medium|low] [--due YYYY-MM-DD]
+ *     gcal-cli gtd-done --id <todoId>
+ *   L3 (Irreversible / External Mutations — requires human approval token/confirmation):
+ *     gcal-cli commit-draft --draft-id <id> --approved-by <triggerOrCallback>
+ *     gcal-cli reschedule --event-id <id> --start <HH:MM> --end <HH:MM> --approved-by <triggerOrCallback>
+ *     gcal-cli delete --event-id <id> --approved-by <triggerOrCallback>
+ */
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
+const dataDir = process.env.AURA_DATA_DIR || join(homedir(), '.dsh', 'state', 'superagent', 'aura-data')
+const storePath = join(dataDir, 'calendar-gtd.json')
+
+const todayStr = () => new Date().toISOString().slice(0, 10)
+
+function defaultStore() {
+  const date = todayStr()
+  return {
+    events: [
+      {
+        id: 'evt_1',
+        date,
+        start: '10:00',
+        end: '11:00',
+        title: '产品架构评审会 (Architecture Review)',
+        location: '线上会议室 A',
+        status: 'confirmed',
+      },
+      {
+        id: 'evt_2',
+        date,
+        start: '14:00',
+        end: '15:30',
+        title: 'DeepSeek Superagent 个人助手联调',
+        location: '本地工作区',
+        status: 'confirmed',
+      },
+      {
+        id: 'evt_3',
+        date,
+        start: '15:00',
+        end: '16:00',
+        title: '外部合作伙伴周会 (与上一段日程存在 30 分钟冲突)',
+        location: 'Zoom',
+        status: 'confirmed',
+      },
+    ],
+    drafts: [],
+    todos: [
+      { id: 'todo_1', title: '完成 Project Aura Phase 2 个人工具链与 L3 审批验证', priority: 'high', status: 'todo', due: date },
+      { id: 'todo_2', title: '审阅本周收件箱中的云服务账单邮件', priority: 'medium', status: 'todo', due: date },
+      { id: 'todo_3', title: '整理知识库归档目录结构', priority: 'low', status: 'todo', due: date },
+    ],
+    auditLog: [],
+  }
+}
+
+function loadStore() {
+  try {
+    return existsSync(storePath) ? JSON.parse(readFileSync(storePath, 'utf8')) : defaultStore()
+  } catch {
+    return defaultStore()
+  }
+}
+
+function saveStore(store) {
+  mkdirSync(dataDir, { recursive: true, mode: 0o700 })
+  writeFileSync(storePath, JSON.stringify(store, null, 2) + '\n', { mode: 0o600 })
+}
+
+function parseArgs(argv) {
+  const cmd = argv[2] || ''
+  const flags = {}
+  for (let i = 3; i < argv.length; i++) {
+    const arg = argv[i]
+    if (arg.startsWith('--')) {
+      const key = arg.slice(2)
+      const next = argv[i + 1]
+      if (next === undefined || next.startsWith('--')) {
+        flags[key] = true
+      } else {
+        flags[key] = next
+        i++
+      }
+    }
+  }
+  return { cmd, flags }
+}
+
+function fail(code, message, tier = 'L1') {
+  process.stderr.write(JSON.stringify({ error: { code, tier, message } }) + '\n')
+  process.exit(code === 403 ? 2 : 1)
+}
+
+function toMinutes(hhmm) {
+  const [h, m] = String(hhmm).split(':').map(Number)
+  return (h || 0) * 60 + (m || 0)
+}
+
+function detectConflicts(events) {
+  const sorted = [...events].sort((a, b) => toMinutes(a.start) - toMinutes(b.start))
+  const conflicts = []
+  for (let i = 0; i < sorted.length; i++) {
+    for (let j = i + 1; j < sorted.length; j++) {
+      const a = sorted[i]
+      const b = sorted[j]
+      if (a.date === b.date && toMinutes(b.start) < toMinutes(a.end)) {
+        conflicts.push({
+          date: a.date,
+          overlapMinutes: toMinutes(a.end) - toMinutes(b.start),
+          first: a,
+          second: b,
+        })
+      }
+    }
+  }
+  return conflicts
+}
+
+function requireL3Approval(flags, actionDesc) {
+  const approvedBy = String(flags['approved-by'] || '').trim()
+  if (!approvedBy) {
+    fail(
+      403,
+      `L3_APPROVAL_REQUIRED: "${actionDesc}" 属于 L3 级不可逆/日程变更操作。请先调用 orchestrator_report(state: "progress", human_action: "...") 向宿主发起内联按钮审批，待宿主在 Telegram 点击确认或回复同意后，携带 --approved-by <确认凭据或回调内容> 重新执行。`,
+      'L3',
+    )
+  }
+  return approvedBy
+}
+
+function main() {
+  const { cmd, flags } = parseArgs(process.argv)
+  const store = loadStore()
+  const date = String(flags.date || todayStr())
+
+  if (cmd === 'list') {
+    const events = store.events.filter(e => !flags.date || e.date === date)
+    const drafts = store.drafts.filter(d => !flags.date || d.date === date)
+    const conflicts = detectConflicts(events)
+    process.stdout.write(JSON.stringify({ date, events, drafts, conflicts }) + '\n')
+    return
+  }
+
+  if (cmd === 'conflicts') {
+    const events = store.events.filter(e => !flags.date || e.date === date)
+    process.stdout.write(JSON.stringify({ date, conflicts: detectConflicts(events) }) + '\n')
+    return
+  }
+
+  if (cmd === 'draft-add') {
+    const title = String(flags.title || '').trim()
+    const start = String(flags.start || '').trim()
+    const end = String(flags.end || '').trim()
+    if (!title || !start || !end) fail(400, 'Usage: gcal-cli draft-add --title <text> --start <HH:MM> --end <HH:MM> [--date YYYY-MM-DD]')
+    const draft = {
+      id: `draft_evt_${Date.now()}`,
+      date,
+      start,
+      end,
+      title,
+      location: String(flags.location || '待定'),
+      status: 'draft',
+      createdAt: new Date().toISOString(),
+    }
+    store.drafts.push(draft)
+    saveStore(store)
+    process.stdout.write(JSON.stringify({ ok: true, tier: 'L2', draft }) + '\n')
+    return
+  }
+
+  if (cmd === 'commit-draft') {
+    const draftId = String(flags['draft-id'] || '').trim()
+    if (!draftId) fail(400, 'Usage: gcal-cli commit-draft --draft-id <id> --approved-by <confirmation>')
+    const approvedBy = requireL3Approval(flags, `正式写入日程草稿 ${draftId}`)
+    const idx = store.drafts.findIndex(d => d.id === draftId)
+    if (idx < 0) fail(404, `Draft not found: ${draftId}`, 'L3')
+    const [draft] = store.drafts.splice(idx, 1)
+    const event = { ...draft, id: `evt_${Date.now()}`, status: 'confirmed', approvedBy }
+    store.events.push(event)
+    store.auditLog.push({ at: new Date().toISOString(), action: 'commit-draft', target: event.id, approvedBy })
+    saveStore(store)
+    process.stdout.write(JSON.stringify({ ok: true, tier: 'L3', event }) + '\n')
+    return
+  }
+
+  if (cmd === 'reschedule') {
+    const eventId = String(flags['event-id'] || '').trim()
+    const start = String(flags.start || '').trim()
+    const end = String(flags.end || '').trim()
+    if (!eventId || !start || !end) fail(400, 'Usage: gcal-cli reschedule --event-id <id> --start <HH:MM> --end <HH:MM> --approved-by <confirmation>')
+    const approvedBy = requireL3Approval(flags, `改期日程 ${eventId} 至 ${start}-${end}`)
+    const event = store.events.find(e => e.id === eventId)
+    if (!event) fail(404, `Event not found: ${eventId}`, 'L3')
+    const previous = { start: event.start, end: event.end, date: event.date }
+    event.start = start
+    event.end = end
+    if (flags.date) event.date = String(flags.date)
+    store.auditLog.push({ at: new Date().toISOString(), action: 'reschedule', target: eventId, previous, next: { start, end, date: event.date }, approvedBy })
+    saveStore(store)
+    process.stdout.write(JSON.stringify({ ok: true, tier: 'L3', event, previous }) + '\n')
+    return
+  }
+
+  if (cmd === 'delete') {
+    const eventId = String(flags['event-id'] || '').trim()
+    if (!eventId) fail(400, 'Usage: gcal-cli delete --event-id <id> --approved-by <confirmation>')
+    const approvedBy = requireL3Approval(flags, `删除日程 ${eventId}`)
+    const idx = store.events.findIndex(e => e.id === eventId)
+    if (idx < 0) fail(404, `Event not found: ${eventId}`, 'L3')
+    const [removed] = store.events.splice(idx, 1)
+    store.auditLog.push({ at: new Date().toISOString(), action: 'delete', target: eventId, removed, approvedBy })
+    saveStore(store)
+    process.stdout.write(JSON.stringify({ ok: true, tier: 'L3', deleted: removed }) + '\n')
+    return
+  }
+
+  if (cmd === 'gtd-list') {
+    const status = String(flags.status || 'all')
+    const todos = store.todos.filter(t => status === 'all' || t.status === status)
+    process.stdout.write(JSON.stringify({ todos }) + '\n')
+    return
+  }
+
+  if (cmd === 'gtd-add') {
+    const title = String(flags.title || '').trim()
+    if (!title) fail(400, 'Usage: gcal-cli gtd-add --title <text> [--priority high|medium|low] [--due YYYY-MM-DD]')
+    const todo = {
+      id: `todo_${Date.now()}`,
+      title,
+      priority: String(flags.priority || 'medium'),
+      status: 'todo',
+      due: String(flags.due || todayStr()),
+    }
+    store.todos.push(todo)
+    saveStore(store)
+    process.stdout.write(JSON.stringify({ ok: true, tier: 'L2', todo }) + '\n')
+    return
+  }
+
+  if (cmd === 'gtd-done') {
+    const id = String(flags.id || '').trim()
+    const todo = store.todos.find(t => t.id === id)
+    if (!todo) fail(404, `Todo not found: ${id}`)
+    todo.status = 'done'
+    todo.completedAt = new Date().toISOString()
+    saveStore(store)
+    process.stdout.write(JSON.stringify({ ok: true, tier: 'L2', todo }) + '\n')
+    return
+  }
+
+  fail(400, `Unknown gcal-cli subcommand: ${cmd}`)
+}
+
+main()

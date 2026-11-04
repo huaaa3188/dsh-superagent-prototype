@@ -1,0 +1,338 @@
+#!/usr/bin/env node
+/**
+ * tg-cli: Controlled Telegram Bot transport CLI for dsh-superagent.
+ *
+ * Subcommands:
+ *   tg-cli pull --after <offset> --json
+ *   tg-cli reply --chat-id <id> --to <msgId> --key <idempotencyKey> --kind <kind> --markdown <text>
+ *   tg-cli thread --chat-id <id> --root <rootMsgId> --json [--after <cursor>]
+ *   tg-cli inject --chat-id <id> --sender-id <senderId> [--bot] --text <text> [--root-id <rootMsgId>]
+ *
+ * Configuration:
+ *   Reads JSON config from $TG_CLI_CONFIG_DIR/config.json (defaults to ~/.config/tg-bot/config.json):
+ *   { "botToken": "123456:ABC-DEF...", "botId": "123456", "botUsername": "aura_bot" }
+ */
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
+const configDir = process.env.TG_CLI_CONFIG_DIR || join(homedir(), '.config', 'tg-bot')
+const configPath = join(configDir, 'config.json')
+const statePath = join(configDir, 'state.json')
+
+function loadJson(path, fallback) {
+  try {
+    return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : fallback
+  } catch {
+    return fallback
+  }
+}
+
+function saveJson(path, data) {
+  mkdirSync(configDir, { recursive: true, mode: 0o700 })
+  writeFileSync(path, JSON.stringify(data, null, 2), { mode: 0o600 })
+}
+
+function parseArgs(argv) {
+  const cmd = argv[2] || ''
+  const flags = {}
+  for (let i = 3; i < argv.length; i++) {
+    const arg = argv[i]
+    if (arg.startsWith('--')) {
+      const key = arg.slice(2)
+      const next = argv[i + 1]
+      if (next === undefined || next.startsWith('--')) {
+        flags[key] = true
+      } else {
+        flags[key] = next
+        i++
+      }
+    }
+  }
+  return { cmd, flags }
+}
+
+function fail(code, message) {
+  process.stderr.write(JSON.stringify({ error: { code, message } }) + '\n')
+  process.exit(1)
+}
+
+async function tgApi(token, method, body) {
+  const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const data = await res.json().catch(() => ({ ok: false, error_code: res.status, description: res.statusText }))
+  if (!data.ok) {
+    const code = data.error_code || res.status || 500
+    const desc = data.description || 'Telegram API error'
+    if (code === 403 || (code === 400 && /chat not found|user is deactivated|message thread not found/i.test(desc))) {
+      fail(410, desc)
+    }
+    fail(code, desc)
+  }
+  return data.result
+}
+
+function extractButtons(markdown) {
+  const match = /<!--\s*buttons:\s*(\[[\s\S]*?\])\s*-->/.exec(markdown)
+  if (!match) return { cleanText: markdown, keyboard: undefined }
+  const cleanText = markdown.replace(match[0], '').trim()
+  try {
+    const items = JSON.parse(match[1])
+    if (!Array.isArray(items) || !items.length) return { cleanText, keyboard: undefined }
+    const row = items.map(btn => ({
+      text: String(btn.label || btn.text || 'Action'),
+      callback_data: String(btn.data || btn.callback_data || 'noop').slice(0, 64),
+    }))
+    return { cleanText, keyboard: { inline_keyboard: [row] } }
+  } catch {
+    return { cleanText, keyboard: undefined }
+  }
+}
+
+function recordThreadItem(state, item) {
+  state.threads = state.threads || {}
+  const root = item.root_id || item.thread_id || item.message_id
+  const key = `${item.chat_id}:${root}`
+  const list = state.threads[key] || []
+  if (!list.some(existing => existing.id === item.id)) {
+    list.push(item)
+    state.threads[key] = list.slice(-200)
+  }
+  state.messageRoots = state.messageRoots || {}
+  const msgKey = `${item.chat_id}:${item.message_id}`
+  if (!state.messageRoots[msgKey] || root !== item.message_id) {
+    state.messageRoots[msgKey] = root
+  }
+}
+
+function normalizeUpdate(update, botInfo, state) {
+  if (update.callback_query) {
+    const cq = update.callback_query
+    const msg = cq.message
+    if (!msg || !msg.chat) return null
+    const chatId = String(msg.chat.id)
+    const msgId = String(msg.message_id)
+    const rootId = (state.messageRoots && state.messageRoots[`${chatId}:${msgId}`]) || msgId
+    return {
+      update_id: update.update_id,
+      callback_query_id: String(cq.id),
+      id: `cb_${cq.id}`,
+      message_id: msgId,
+      chat_id: chatId,
+      chat_type: msg.chat.type || 'private',
+      root_id: rootId,
+      reply_to_id: msgId,
+      ...(msg.message_thread_id ? { thread_id: String(msg.message_thread_id) } : {}),
+      sender: {
+        id: String(cq.from.id),
+        ...(cq.from.first_name ? { name: cq.from.first_name } : {}),
+        bot: Boolean(cq.from.is_bot),
+      },
+      mentions_me: true,
+      text: String(cq.data || ''),
+      at: new Date().toISOString(),
+    }
+  }
+  const msg = update.message || update.edited_message
+  if (!msg || !msg.chat || !msg.from) return null
+  const text = msg.text || msg.caption || ''
+  if (!text.trim()) return null
+  const chatId = String(msg.chat.id)
+  const msgId = String(msg.message_id)
+  const replyToId = msg.reply_to_message ? String(msg.reply_to_message.message_id) : undefined
+  const knownRoot = replyToId && state.messageRoots ? state.messageRoots[`${chatId}:${replyToId}`] : undefined
+  const rootId = knownRoot || (msg.message_thread_id ? String(msg.message_thread_id) : replyToId || msgId)
+  const username = botInfo.username ? `@${botInfo.username.toLowerCase()}` : ''
+  const mentioned = Boolean(
+    (username && text.toLowerCase().includes(username)) ||
+    (msg.reply_to_message && msg.reply_to_message.from && String(msg.reply_to_message.from.id) === String(botInfo.id))
+  )
+  const id = update.edited_message && msg.edit_date ? `${msgId}_edit_${msg.edit_date}` : msgId
+  return {
+    update_id: update.update_id,
+    id,
+    message_id: msgId,
+    chat_id: chatId,
+    chat_type: msg.chat.type || 'private',
+    root_id: rootId,
+    ...(replyToId ? { reply_to_id: replyToId } : {}),
+    ...(msg.message_thread_id ? { thread_id: String(msg.message_thread_id) } : {}),
+    sender: {
+      id: String(msg.from.id),
+      ...(msg.from.first_name ? { name: msg.from.first_name } : {}),
+      bot: Boolean(msg.from.is_bot),
+    },
+    mentions_me: mentioned,
+    text,
+    at: new Date((msg.edit_date || msg.date || Math.floor(Date.now() / 1000)) * 1000).toISOString(),
+  }
+}
+
+async function main() {
+  const { cmd, flags } = parseArgs(process.argv)
+  const config = loadJson(configPath, {})
+  const state = loadJson(statePath, { nextUpdateId: 1, sentKeys: {}, injected: [], threads: {}, messageRoots: {} })
+  const botId = String(config.botId || process.env.TELEGRAM_BOT_ID || 'telegram-bot')
+  const botUsername = String(config.botUsername || process.env.TELEGRAM_BOT_USERNAME || 'aura_bot')
+  const token = config.botToken || process.env.TELEGRAM_BOT_TOKEN
+
+  if (cmd === 'inject') {
+    const chatId = String(flags['chat-id'] || '')
+    const senderId = String(flags['sender-id'] || 'cron-bot')
+    const text = String(flags.text || '')
+    if (!chatId || !text) fail(400, 'Usage: tg-cli inject --chat-id <id> --sender-id <id> [--bot] --text <text>')
+    const updateId = Math.max(state.nextUpdateId || 1, ...state.injected.map(u => u.update_id + 1), 1)
+    const msgId = `inj_${updateId}`
+    const rootId = String(flags['root-id'] || msgId)
+    const item = {
+      update_id: updateId,
+      id: msgId,
+      message_id: msgId,
+      chat_id: chatId,
+      chat_type: flags['chat-type'] || (chatId.startsWith('-') ? 'supergroup' : 'private'),
+      root_id: rootId,
+      sender: { id: senderId, name: String(flags['sender-name'] || senderId), bot: Boolean(flags.bot) },
+      mentions_me: true,
+      text,
+      at: new Date().toISOString(),
+    }
+    state.injected.push(item)
+    state.nextUpdateId = updateId + 1
+    recordThreadItem(state, item)
+    saveJson(statePath, state)
+    process.stdout.write(JSON.stringify({ ok: true, injected: item }) + '\n')
+    return
+  }
+
+  if (cmd === 'pull') {
+    const after = Number(flags.after || 0)
+    const items = []
+    let next = Math.max(after, state.nextUpdateId || 1)
+
+    // 1. Drain locally injected items with update_id >= after
+    const remainingInjected = []
+    for (const item of state.injected || []) {
+      if (item.update_id >= after) {
+        items.push(item)
+        if (item.update_id + 1 > next) next = item.update_id + 1
+      } else {
+        remainingInjected.push(item)
+      }
+    }
+    state.injected = remainingInjected
+
+    // 2. If a live Telegram Bot token is configured, poll getUpdates
+    if (token) {
+      const updates = await tgApi(token, 'getUpdates', {
+        offset: after,
+        timeout: Number(flags.timeout || 1),
+        allowed_updates: ['message', 'edited_message', 'callback_query'],
+      })
+      // Reload state after network wait so concurrent `tg-cli reply` writes to messageRoots/sentKeys are never overwritten.
+      const latest = loadJson(statePath, { nextUpdateId: 1, sentKeys: {}, injected: [], threads: {}, messageRoots: {} })
+      state.sentKeys = { ...(latest.sentKeys || {}), ...(state.sentKeys || {}) }
+      state.messageRoots = { ...(latest.messageRoots || {}), ...(state.messageRoots || {}) }
+      state.threads = { ...(latest.threads || {}), ...(state.threads || {}) }
+
+      for (const u of updates) {
+        if (u.update_id + 1 > next) next = u.update_id + 1
+        const normalized = normalizeUpdate(u, { id: botId, username: botUsername }, state)
+        if (!normalized) continue
+        if (normalized.callback_query_id) {
+          await tgApi(token, 'answerCallbackQuery', {
+            callback_query_id: normalized.callback_query_id,
+            text: `✓ 已收到：${normalized.text}`,
+          }).catch(() => {})
+          if (/^\d+$/.test(normalized.message_id)) {
+            await tgApi(token, 'editMessageReplyMarkup', {
+              chat_id: normalized.chat_id,
+              message_id: Number(normalized.message_id),
+              reply_markup: { inline_keyboard: [] },
+            }).catch(() => {})
+          }
+        }
+        recordThreadItem(state, normalized)
+        items.push(normalized)
+      }
+    }
+
+    state.nextUpdateId = next
+    saveJson(statePath, state)
+    process.stdout.write(JSON.stringify({ me: botId, items, next }) + '\n')
+    return
+  }
+
+  if (cmd === 'reply') {
+    const chatId = String(flags['chat-id'] || '')
+    const to = String(flags.to || '')
+    const key = String(flags.key || '')
+    const markdown = String(flags.markdown || '')
+    if (!chatId || !to || !key || !markdown) fail(400, 'Missing required reply flags')
+    state.sentKeys = state.sentKeys || {}
+    if (state.sentKeys[key]) {
+      process.stdout.write(JSON.stringify({ ok: true, reused: true, message_id: state.sentKeys[key] }) + '\n')
+      return
+    }
+    const { cleanText, keyboard } = extractButtons(markdown)
+    let sentMsgId = `local_${Date.now()}`
+    if (token) {
+      const basePayload = {
+        chat_id: chatId,
+        text: cleanText,
+        ...( /^\d+$/.test(to) ? { reply_parameters: { message_id: Number(to), allow_sending_without_reply: true } } : {}),
+        ...(flags['thread-id'] && /^\d+$/.test(String(flags['thread-id'])) ? { message_thread_id: Number(flags['thread-id']) } : {}),
+        ...(keyboard ? { reply_markup: keyboard } : {}),
+      }
+      let res
+      const trySend = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...basePayload, parse_mode: 'Markdown' }),
+      }).then(r => r.json()).catch(() => ({ ok: false }))
+      if (trySend.ok) {
+        res = trySend.result
+      } else if (trySend.error_code === 400 && /can't parse entities/i.test(trySend.description || '')) {
+        res = await tgApi(token, 'sendMessage', basePayload)
+      } else {
+        res = await tgApi(token, 'sendMessage', basePayload)
+      }
+      sentMsgId = String(res.message_id)
+    }
+    const rootId = (state.messageRoots && state.messageRoots[`${chatId}:${to}`]) || to
+    recordThreadItem(state, {
+      id: sentMsgId,
+      message_id: sentMsgId,
+      chat_id: chatId,
+      chat_type: chatId.startsWith('-') ? 'supergroup' : 'private',
+      root_id: rootId,
+      reply_to_id: to,
+      sender: { id: botId, name: botUsername, bot: true },
+      mentions_me: false,
+      text: cleanText,
+      at: new Date().toISOString(),
+    })
+    state.sentKeys[key] = sentMsgId
+    saveJson(statePath, state)
+    process.stdout.write(JSON.stringify({ ok: true, message_id: sentMsgId }) + '\n')
+    return
+  }
+
+  if (cmd === 'thread') {
+    const chatId = String(flags['chat-id'] || '')
+    const root = String(flags.root || '')
+    const after = flags.after ? Number(flags.after) : 0
+    const all = (state.threads && state.threads[`${chatId}:${root}`]) || []
+    const pageSize = 20
+    const slice = all.slice(after, after + pageSize)
+    const next = after + pageSize < all.length ? String(after + pageSize) : undefined
+    process.stdout.write(JSON.stringify({ items: slice, ...(next ? { next } : {}) }) + '\n')
+    return
+  }
+
+  fail(400, `Unknown tg-cli subcommand: ${cmd}`)
+}
+
+main().catch(err => fail(500, err instanceof Error ? err.message : String(err)))

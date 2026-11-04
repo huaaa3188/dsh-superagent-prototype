@@ -7,6 +7,8 @@
 - id: dsh-superagent
   config:
     stateDir: <absolute path, for example /home/me/.dsh/state/superagent>
-# Feishu is optional: uncomment to enable its Source, then set the bot's lark-cli on the Feishu Source.
+# Feishu / Telegram are optional: uncomment to enable their Source.
 # - id: dsh-superagent-feishu
+#   disabled: false
+# - id: dsh-superagent-telegram
 #   disabled: false

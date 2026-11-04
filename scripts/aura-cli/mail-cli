@@ -1,0 +1,188 @@
+#!/usr/bin/env node
+/**
+ * mail-cli: Controlled Email & Inbox CLI for Project Aura (dsh-superagent).
+ *
+ * Permission Tiers:
+ *   L1 (Read-only):
+ *     mail-cli unread [--limit <n>]
+ *     mail-cli read --id <msgId>
+ *     mail-cli search --query <keyword>
+ *   L2 (Reversible Drafts):
+ *     mail-cli draft --to <email> --subject <text> --body <text> [--reply-to <msgId>]
+ *     mail-cli drafts
+ *   L3 (External Send / Irreversible Delete — requires human approval token/confirmation):
+ *     mail-cli send --draft-id <id> --approved-by <triggerOrCallback>
+ *     mail-cli delete --id <msgId> --approved-by <triggerOrCallback>
+ */
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
+const dataDir = process.env.AURA_DATA_DIR || join(homedir(), '.dsh', 'state', 'superagent', 'aura-data')
+const storePath = join(dataDir, 'mail-inbox.json')
+
+function defaultStore() {
+  return {
+    messages: [
+      {
+        id: 'mail_101',
+        from: 'billing@cloud-provider.example.com',
+        subject: '[重要] 11月云主机账单与续费提醒 (USD $48.00)',
+        receivedAt: '2026-11-04T00:30:00.000Z',
+        unread: true,
+        priority: 'high',
+        body: '您好，您名下的美西 VPS 实例 (2C4G) 本月账单为 $48.00，将于 11 月 10 日自动扣款。如需调整配置请回复本邮件或登录控制台。',
+      },
+      {
+        id: 'mail_102',
+        from: 'partner@tech-summit.example.org',
+        subject: '周三下午 15:00 合作伙伴周会确认',
+        receivedAt: '2026-11-04T00:45:00.000Z',
+        unread: true,
+        priority: 'high',
+        body: 'Runhua 你好，今天下午 15:00-16:00 的线上同步会我们想重点讨论 AI 助理的权限分级方案，请问时间是否方便？如果与其他会议冲突，也可以改到明天上午 10:30。',
+      },
+    ],
+    drafts: [],
+    sent: [],
+    auditLog: [],
+  }
+}
+
+function loadStore() {
+  try {
+    return existsSync(storePath) ? JSON.parse(readFileSync(storePath, 'utf8')) : defaultStore()
+  } catch {
+    return defaultStore()
+  }
+}
+
+function saveStore(store) {
+  mkdirSync(dataDir, { recursive: true, mode: 0o700 })
+  writeFileSync(storePath, JSON.stringify(store, null, 2) + '\n', { mode: 0o600 })
+}
+
+function parseArgs(argv) {
+  const cmd = argv[2] || ''
+  const flags = {}
+  for (let i = 3; i < argv.length; i++) {
+    const arg = argv[i]
+    if (arg.startsWith('--')) {
+      const key = arg.slice(2)
+      const next = argv[i + 1]
+      if (next === undefined || next.startsWith('--')) {
+        flags[key] = true
+      } else {
+        flags[key] = next
+        i++
+      }
+    }
+  }
+  return { cmd, flags }
+}
+
+function fail(code, message, tier = 'L1') {
+  process.stderr.write(JSON.stringify({ error: { code, tier, message } }) + '\n')
+  process.exit(code === 403 ? 2 : 1)
+}
+
+function requireL3Approval(flags, actionDesc) {
+  const approvedBy = String(flags['approved-by'] || '').trim()
+  if (!approvedBy) {
+    fail(
+      403,
+      `L3_APPROVAL_REQUIRED: "${actionDesc}" 属于 L3 级对外发送/不可逆写操作。请先用 mail-cli draft 创建草稿，再调用 orchestrator_report(state: "progress", human_action: "...") 向宿主发起内联按钮审批，待宿主点击确认后携带 --approved-by <确认凭据> 执行。`,
+      'L3',
+    )
+  }
+  return approvedBy
+}
+
+function main() {
+  const { cmd, flags } = parseArgs(process.argv)
+  const store = loadStore()
+
+  if (cmd === 'unread') {
+    const limit = Number(flags.limit || 20)
+    const items = store.messages.filter(m => m.unread).slice(0, limit)
+    process.stdout.write(JSON.stringify({ count: items.length, items }) + '\n')
+    return
+  }
+
+  if (cmd === 'read') {
+    const id = String(flags.id || '').trim()
+    const msg = store.messages.find(m => m.id === id)
+    if (!msg) fail(404, `Message not found: ${id}`)
+    process.stdout.write(JSON.stringify({ message: msg }) + '\n')
+    return
+  }
+
+  if (cmd === 'search') {
+    const q = String(flags.query || '').toLowerCase()
+    const items = store.messages.filter(
+      m => m.subject.toLowerCase().includes(q) || m.body.toLowerCase().includes(q) || m.from.toLowerCase().includes(q),
+    )
+    process.stdout.write(JSON.stringify({ query: q, count: items.length, items }) + '\n')
+    return
+  }
+
+  if (cmd === 'draft') {
+    const to = String(flags.to || '').trim()
+    const subject = String(flags.subject || '').trim()
+    const body = String(flags.body || '').trim()
+    if (!to || !subject || !body) fail(400, 'Usage: mail-cli draft --to <email> --subject <text> --body <text> [--reply-to <msgId>]')
+    const draft = {
+      id: `draft_mail_${Date.now()}`,
+      to,
+      subject,
+      body,
+      ...(flags['reply-to'] ? { replyTo: String(flags['reply-to']) } : {}),
+      createdAt: new Date().toISOString(),
+    }
+    store.drafts.push(draft)
+    saveStore(store)
+    process.stdout.write(JSON.stringify({ ok: true, tier: 'L2', draft }) + '\n')
+    return
+  }
+
+  if (cmd === 'drafts') {
+    process.stdout.write(JSON.stringify({ drafts: store.drafts }) + '\n')
+    return
+  }
+
+  if (cmd === 'send') {
+    const draftId = String(flags['draft-id'] || '').trim()
+    if (!draftId) fail(400, 'Usage: mail-cli send --draft-id <id> --approved-by <confirmation>')
+    const approvedBy = requireL3Approval(flags, `对外发送邮件草稿 ${draftId}`)
+    const idx = store.drafts.findIndex(d => d.id === draftId)
+    if (idx < 0) fail(404, `Draft not found: ${draftId}`, 'L3')
+    const [draft] = store.drafts.splice(idx, 1)
+    const sentMsg = { ...draft, sentId: `sent_${Date.now()}`, sentAt: new Date().toISOString(), approvedBy }
+    store.sent.push(sentMsg)
+    if (draft.replyTo) {
+      const orig = store.messages.find(m => m.id === draft.replyTo)
+      if (orig) orig.unread = false
+    }
+    store.auditLog.push({ at: sentMsg.sentAt, action: 'send', draftId, to: draft.to, subject: draft.subject, approvedBy })
+    saveStore(store)
+    process.stdout.write(JSON.stringify({ ok: true, tier: 'L3', sent: sentMsg }) + '\n')
+    return
+  }
+
+  if (cmd === 'delete') {
+    const id = String(flags.id || '').trim()
+    if (!id) fail(400, 'Usage: mail-cli delete --id <msgId> --approved-by <confirmation>')
+    const approvedBy = requireL3Approval(flags, `永久删除邮件 ${id}`)
+    const idx = store.messages.findIndex(m => m.id === id)
+    if (idx < 0) fail(404, `Message not found: ${id}`, 'L3')
+    const [removed] = store.messages.splice(idx, 1)
+    store.auditLog.push({ at: new Date().toISOString(), action: 'delete', id, subject: removed.subject, approvedBy })
+    saveStore(store)
+    process.stdout.write(JSON.stringify({ ok: true, tier: 'L3', deleted: removed }) + '\n')
+    return
+  }
+
+  fail(400, `Unknown mail-cli subcommand: ${cmd}`)
+}
+
+main()

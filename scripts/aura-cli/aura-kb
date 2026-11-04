@@ -1,0 +1,259 @@
+#!/usr/bin/env node
+/**
+ * aura-kb: L3 Cold Archive Knowledge Base CLI for Personal Super-Agent (Project Aura)
+ *
+ * Manages Markdown knowledge artifacts under $ORCHESTRATOR_DATA_DIR/knowledge/:
+ * - L1 (Read-only):
+ *   - `aura-kb list [--category <reports|notes|decisions>]`
+ *   - `aura-kb search --query <keyword>`
+ *   - `aura-kb read --path <relative-path>`
+ * - L2 (Reversible Archive Write):
+ *   - `aura-kb save --category <reports|notes|decisions> --slug <slug> --title <title> [--summary <text>] [--tags <csv>] [--content <md> | --file <path>]`
+ */
+import fs from 'node:fs'
+import path from 'node:path'
+import os from 'node:os'
+
+function parseArgs(argv) {
+  const args = argv.slice(2)
+  const cmd = args[0] || 'help'
+  const flags = {}
+  for (let i = 1; i < args.length; i++) {
+    const a = args[i]
+    if (a.startsWith('--')) {
+      const k = a.slice(2)
+      const next = args[i + 1]
+      if (!next || next.startsWith('--')) {
+        flags[k] = true
+      } else {
+        flags[k] = next
+        i++
+      }
+    }
+  }
+  return { cmd, flags }
+}
+
+function getKnowledgeRoot() {
+  if (process.env.ORCHESTRATOR_KB_DIR) return process.env.ORCHESTRATOR_KB_DIR
+  const dataDir =
+    process.env.ORCHESTRATOR_DATA_DIR ||
+    path.join(os.homedir(), '.dsh', 'state', 'superagent', 'aura-data')
+  return path.join(dataDir, 'knowledge')
+}
+
+function ensureLayout(root) {
+  for (const sub of ['reports', 'notes', 'decisions']) {
+    fs.mkdirSync(path.join(root, sub), { recursive: true })
+  }
+  const indexFile = path.join(root, 'index.json')
+  if (!fs.existsSync(indexFile)) {
+    const seedEntries = [
+      {
+        id: 'kb_seed_1',
+        category: 'notes',
+        slug: 'project-aura-overview',
+        title: 'Project Aura 个人伴侣架构与工作流备忘',
+        summary: '记录 L1/L2/L3 三层共生记忆映射、Telegram 内联审批协议以及每日晨报规则。',
+        tags: ['architecture', 'aura', 'memory'],
+        relPath: 'notes/2026-11-04-project-aura-overview.md',
+        updatedAt: '2026-11-04T08:00:00.000Z',
+      },
+    ]
+    const seedDocPath = path.join(root, 'notes', '2026-11-04-project-aura-overview.md')
+    if (!fs.existsSync(seedDocPath)) {
+      fs.writeFileSync(
+        seedDocPath,
+        [
+          '---',
+          'title: Project Aura 个人伴侣架构与工作流备忘',
+          'category: notes',
+          'tags: architecture, aura, memory',
+          'updated_at: 2026-11-04T08:00:00.000Z',
+          '---',
+          '',
+          '# Project Aura 个人伴侣架构与工作流备忘',
+          '',
+          '- **L1 核心画像 (Prompts)**：存储在 SQLite 版本化 Prompts 中，包含沟通规范与个人作息偏好。',
+          '- **L2 活跃状态 (Store)**：由 Orchestrator Tickets、Threads 与 Outbox 实时承载。',
+          '- **L3 长期知识库 (Knowledge)**：沉淀于 `$ORCHESTRATOR_DATA_DIR/knowledge/`，通过 `aura-kb` 检索与归档。',
+          '',
+        ].join('\n'),
+        'utf8',
+      )
+    }
+    fs.writeFileSync(indexFile, JSON.stringify({ entries: seedEntries }, null, 2), 'utf8')
+    rebuildMarkdownIndex(root, seedEntries)
+  }
+}
+
+function loadIndex(root) {
+  ensureLayout(root)
+  const indexFile = path.join(root, 'index.json')
+  try {
+    return JSON.parse(fs.readFileSync(indexFile, 'utf8'))
+  } catch {
+    return { entries: [] }
+  }
+}
+
+function rebuildMarkdownIndex(root, entries) {
+  const lines = [
+    '# Project Aura 长期知识库索引 (L3 Cold Archive)',
+    '',
+    `> 自动生成于 ${new Date().toISOString()} · 共 ${entries.length} 篇归档文档`,
+    '',
+    '| 分类 | 标题 | 标签 | 路径 | 更新时间 |',
+    '| :--- | :--- | :--- | :--- | :--- |',
+  ]
+  for (const item of entries) {
+    const tags = Array.isArray(item.tags) ? item.tags.join(', ') : ''
+    lines.push(`| \`${item.category}\` | **${item.title}** — ${item.summary || ''} | ${tags} | \`${item.relPath}\` | ${item.updatedAt.slice(0, 10)} |`)
+  }
+  lines.push('')
+  fs.writeFileSync(path.join(root, 'INDEX.md'), lines.join('\n'), 'utf8')
+}
+
+function saveIndex(root, data) {
+  const indexFile = path.join(root, 'index.json')
+  fs.writeFileSync(indexFile, JSON.stringify(data, null, 2), 'utf8')
+  rebuildMarkdownIndex(root, data.entries || [])
+}
+
+function out(obj) {
+  process.stdout.write(JSON.stringify(obj) + '\n')
+}
+
+function fail(code, message) {
+  process.stderr.write(JSON.stringify({ error: { code, message } }) + '\n')
+  process.exit(1)
+}
+
+function main() {
+  const { cmd, flags } = parseArgs(process.argv)
+  const root = getKnowledgeRoot()
+  const index = loadIndex(root)
+
+  if (cmd === 'list') {
+    const category = flags.category ? String(flags.category) : null
+    const entries = category
+      ? index.entries.filter(e => e.category === category)
+      : index.entries
+    out({ root, count: entries.length, entries })
+    return
+  }
+
+  if (cmd === 'search') {
+    const q = String(flags.query || '').trim().toLowerCase()
+    if (!q) fail(400, 'Usage: aura-kb search --query <keyword>')
+    const results = []
+    for (const entry of index.entries) {
+      const absPath = path.join(root, entry.relPath)
+      let body = ''
+      try {
+        body = fs.readFileSync(absPath, 'utf8')
+      } catch {}
+      const haystack = `${entry.title} ${entry.summary || ''} ${(entry.tags || []).join(' ')} ${body}`.toLowerCase()
+      if (haystack.includes(q)) {
+        const snippet = body
+          .split('\n')
+          .filter(line => line.toLowerCase().includes(q))
+          .slice(0, 3)
+          .join(' / ')
+        results.push({ ...entry, snippet: snippet || entry.summary })
+      }
+    }
+    out({ query: q, count: results.length, results })
+    return
+  }
+
+  if (cmd === 'read') {
+    const relPath = String(flags.path || '').trim()
+    if (!relPath || relPath.includes('..')) fail(400, 'Usage: aura-kb read --path <relative-path>')
+    const absPath = path.join(root, relPath)
+    if (!fs.existsSync(absPath)) fail(404, `Knowledge file not found: ${relPath}`)
+    const content = fs.readFileSync(absPath, 'utf8')
+    out({ path: relPath, absPath, content })
+    return
+  }
+
+  if (cmd === 'save') {
+    const category = String(flags.category || 'reports').trim()
+    if (!['reports', 'notes', 'decisions'].includes(category)) {
+      fail(400, 'Invalid --category; must be one of: reports, notes, decisions')
+    }
+    const slug = String(flags.slug || '')
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9-_]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+    const title = String(flags.title || '').trim()
+    if (!slug || !title) {
+      fail(400, 'Usage: aura-kb save --category <reports|notes|decisions> --slug <slug> --title <title> [--summary <text>] [--tags <csv>] [--content <md> | --file <path>]')
+    }
+    let bodyContent = ''
+    if (flags.file) {
+      const srcFile = path.resolve(String(flags.file))
+      if (!fs.existsSync(srcFile)) fail(404, `Source file not found: ${srcFile}`)
+      bodyContent = fs.readFileSync(srcFile, 'utf8')
+    } else if (flags.content) {
+      bodyContent = String(flags.content)
+    } else {
+      fail(400, 'Missing --content <markdown> or --file <path>')
+    }
+    const summary = String(flags.summary || bodyContent.replace(/^#.*$/gm, '').trim().slice(0, 120)).trim()
+    const tags = flags.tags
+      ? String(flags.tags).split(',').map(s => s.trim()).filter(Boolean)
+      : []
+    const datePrefix = new Date().toISOString().slice(0, 10)
+    const relPath = `${category}/${datePrefix}-${slug}.md`
+    const absPath = path.join(root, relPath)
+    const now = new Date().toISOString()
+
+    const fullDoc = bodyContent.startsWith('---')
+      ? bodyContent
+      : [
+          '---',
+          `title: ${title}`,
+          `category: ${category}`,
+          `tags: ${tags.join(', ')}`,
+          `updated_at: ${now}`,
+          '---',
+          '',
+          bodyContent,
+          '',
+        ].join('\n')
+
+    fs.mkdirSync(path.dirname(absPath), { recursive: true })
+    fs.writeFileSync(absPath, fullDoc, 'utf8')
+
+    const existingIdx = index.entries.findIndex(e => e.relPath === relPath || e.slug === slug)
+    const entry = {
+      id: existingIdx >= 0 ? index.entries[existingIdx].id : `kb_${Date.now()}`,
+      category,
+      slug,
+      title,
+      summary,
+      tags,
+      relPath,
+      updatedAt: now,
+    }
+    if (existingIdx >= 0) index.entries[existingIdx] = entry
+    else index.entries.unshift(entry)
+
+    saveIndex(root, index)
+    out({ ok: true, tier: 'L2', entry, absPath, indexPath: path.join(root, 'INDEX.md') })
+    return
+  }
+
+  out({
+    commands: [
+      'list [--category <reports|notes|decisions>]',
+      'search --query <keyword>',
+      'read --path <relative-path>',
+      'save --category <reports|notes|decisions> --slug <slug> --title <title> [--summary <text>] [--tags <csv>] [--content <md> | --file <path>]',
+    ],
+  })
+}
+
+main()

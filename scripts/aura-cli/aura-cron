@@ -1,0 +1,151 @@
+#!/usr/bin/env node
+/**
+ * aura-cron: Proactive Cron Trigger Injector & Crontab Generator for Project Aura
+ *
+ * Commands:
+ * - `aura-cron morning-briefing [--chat-id <id>] [--cli <tg-cli-path>]`
+ * - `aura-cron memory-digest [--chat-id <id>] [--cli <tg-cli-path>]`
+ * - `aura-cron print-crontab [--chat-id <id>] [--repo-dir <path>]`
+ */
+import { execFileSync } from 'node:child_process'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+function parseArgs(argv) {
+  const args = argv.slice(2)
+  const cmd = args[0] || 'help'
+  const flags = {}
+  for (let i = 1; i < args.length; i++) {
+    const a = args[i]
+    if (a.startsWith('--')) {
+      const k = a.slice(2)
+      const next = args[i + 1]
+      if (!next || next.startsWith('--')) {
+        flags[k] = true
+      } else {
+        flags[k] = next
+        i++
+      }
+    }
+  }
+  return { cmd, flags }
+}
+
+function resolveDefaultChatId(flags) {
+  if (flags['chat-id']) return String(flags['chat-id'])
+  if (process.env.AURA_DEFAULT_CHAT_ID) return process.env.AURA_DEFAULT_CHAT_ID
+  const configDir = process.env.TG_CLI_CONFIG_DIR || path.join(os.homedir(), '.config', 'tg-bot')
+  try {
+    const cfgPath = path.join(configDir, 'config.json')
+    if (fs.existsSync(cfgPath)) {
+      const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'))
+      if (cfg.defaultChatId) return String(cfg.defaultChatId)
+    }
+    const statePath = path.join(configDir, 'state.json')
+    if (fs.existsSync(statePath)) {
+      const st = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+      const firstKey = Object.keys(st.threads || {})[0]
+      if (firstKey && firstKey.includes(':')) return firstKey.split(':')[0]
+    }
+  } catch {}
+  return ''
+}
+
+function resolveTgCli(flags) {
+  if (flags.cli) return String(flags.cli)
+  const localScript = path.resolve(__dirname, 'tg-cli')
+  if (fs.existsSync(localScript)) return localScript
+  return path.join(os.homedir(), '.local', 'bin', 'tg-cli')
+}
+
+function main() {
+  const { cmd, flags } = parseArgs(process.argv)
+  const chatId = resolveDefaultChatId(flags)
+  const tgCli = resolveTgCli(flags)
+
+  if (cmd === 'morning-briefing') {
+    const dateStr = new Date().toISOString().slice(0, 10)
+    const text = `[CRON:morning-briefing] 请生成 ${dateStr} 今日晨间简报：调用 gcal-cli list --today、gcal-cli conflicts、gcal-cli gtd-list 与 mail-cli unread，输出【今日日程视图】【Top 3 杠杆待办】【重要邮件雷达】，并在末尾附上 <!-- buttons: [{"label":"✓ 确认行程","data":"confirm_schedule"},{"label":"📝 补充待办","data":"add_todo"},{"label":"🔕 今日免打扰","data":"dnd_today"}] -->`
+    const out = execFileSync(
+      process.execPath,
+      [
+        tgCli,
+        'inject',
+        '--chat-id',
+        chatId,
+        '--sender-id',
+        'cron-bot',
+        '--sender-name',
+        'Daily Scheduler',
+        '--bot',
+        '--text',
+        text,
+      ],
+      { encoding: 'utf8', env: process.env },
+    )
+    process.stdout.write(out)
+    return
+  }
+
+  if (cmd === 'memory-digest') {
+    const dateStr = new Date().toISOString().slice(0, 10)
+    const text = `[CRON:memory-digest] 请执行 ${dateStr} 长期知识库巡检与沉淀：调用 aura-kb list 查看当前归档，将近期重要进展或待办复盘通过 aura-kb save 归档至 notes，并返回归档路径与摘要。`
+    const out = execFileSync(
+      process.execPath,
+      [
+        tgCli,
+        'inject',
+        '--chat-id',
+        chatId,
+        '--sender-id',
+        'cron-bot',
+        '--sender-name',
+        'Daily Scheduler',
+        '--bot',
+        '--text',
+        text,
+      ],
+      { encoding: 'utf8', env: process.env },
+    )
+    process.stdout.write(out)
+    return
+  }
+
+  if (cmd === 'print-crontab') {
+    const repoDir = flags['repo-dir']
+      ? path.resolve(String(flags['repo-dir']))
+      : path.resolve(__dirname, '..', '..')
+    const binDir = path.join(os.homedir(), '.local', 'bin')
+    const lines = [
+      '# Project Aura (dsh-superagent) Scheduled Crontab',
+      'PATH=' + `${binDir}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`,
+      '',
+      '# 1. 每日 07:55 注入晨间主动简报触发器 (08:00 准时推送 Telegram 晨报卡片)',
+      `55 7 * * * ${binDir}/aura-cron morning-briefing --chat-id ${chatId} >/dev/null 2>&1`,
+      '',
+      '# 2. 每周日 21:00 触发长期知识库 (L3 Cold Archive) 周期复盘归档',
+      `0 21 * * 0 ${binDir}/aura-cron memory-digest --chat-id ${chatId} >/dev/null 2>&1`,
+      '',
+      '# 3. 每小时自愈巡检 (遵循 docs/006-deployment.md Hourly Check)',
+      `0 * * * * ${repoDir}/scripts/dsh-superagent --profile superagent status >/dev/null || [ $? -eq 1 ] && ${repoDir}/scripts/dsh-superagent --profile superagent --respect-stop restart`,
+    ]
+    process.stdout.write(JSON.stringify({ chatId, crontab: lines.join('\n') }) + '\n')
+    return
+  }
+
+  process.stdout.write(
+    JSON.stringify({
+      commands: [
+        'morning-briefing [--chat-id <id>]',
+        'memory-digest [--chat-id <id>]',
+        'print-crontab [--chat-id <id>] [--repo-dir <path>]',
+      ],
+    }) + '\n',
+  )
+}
+
+main()
