@@ -171,14 +171,25 @@ export async function pollTelegram(ctx: SourceContext, signal: AbortSignal): Pro
   return { read: page.items.length, unreadable }
 }
 
-async function watchTelegram(ctx: SourceContext, signal: AbortSignal): Promise<void> {
+export const TELEGRAM_MAX_BACKOFF_MS = 300_000
+
+/** Computes the wait duration before the next Telegram poll, applying exponential backoff on consecutive failures. */
+export function telegramPollDelay(pollSeconds: number, failures: number): number {
+  const baseMs = (pollSeconds > 0 ? pollSeconds : 10) * 1000
+  if (failures <= 0) return baseMs
+  return Math.min(TELEGRAM_MAX_BACKOFF_MS, baseMs * (2 ** Math.min(failures, 6)))
+}
+
+export async function watchTelegram(ctx: SourceContext, signal: AbortSignal): Promise<void> {
   await ctx.ready
   if (!ctx.configured()) { ctx.report('telegram', health('paused', 'setupPending')); return }
   let failures = 0
   while (!signal.aborted) {
     const config = ctx.config<TelegramConfig>(SOURCE)
-    if (!config) ctx.report('telegram', health('paused', 'sourceOff'))
-    else {
+    if (!config) {
+      failures = 0
+      ctx.report('telegram', health('paused', 'sourceOff'))
+    } else {
       const at = new Date().toISOString()
       try {
         const { read, unreadable } = await pollTelegram(ctx, signal)
@@ -191,7 +202,7 @@ async function watchTelegram(ctx: SourceContext, signal: AbortSignal): Promise<v
         }
       }
     }
-    await delay((config?.pollSeconds ?? 10) * 1000, undefined, { signal }).catch(() => {})
+    await delay(telegramPollDelay(config?.pollSeconds ?? 10, failures), undefined, { signal }).catch(() => {})
   }
 }
 

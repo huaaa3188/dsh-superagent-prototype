@@ -2,6 +2,11 @@
 /**
  * gcal-cli: Controlled Calendar & GTD CLI for Project Aura (dsh-superagent).
  *
+ * Supports dual backends:
+ *   1. Google Calendar REST API v3 (OAuth2 Refresh Token / Access Token / Service Account RS256 JWT)
+ *      with automatic exponential backoff retry on network jitter, 429, and 5xx errors.
+ *   2. Local JSON store fallback (<AURA_DATA_DIR>/calendar-gtd.json) when no cloud credentials are set.
+ *
  * Permission Tiers:
  *   L1 (Read-only):
  *     gcal-cli list [--date YYYY-MM-DD]
@@ -16,14 +21,20 @@
  *     gcal-cli reschedule --event-id <id> --start <HH:MM> --end <HH:MM> --approved-by <triggerOrCallback>
  *     gcal-cli delete --event-id <id> --approved-by <triggerOrCallback>
  */
+import { createSign } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 const dataDir = process.env.AURA_DATA_DIR || join(homedir(), '.dsh', 'state', 'superagent', 'aura-data')
 const storePath = join(dataDir, 'calendar-gtd.json')
+const gcalConfigPath = process.env.AURA_GCAL_CONFIG || join(homedir(), '.config', 'aura-agent', 'gcal.json')
 
 const todayStr = () => new Date().toISOString().slice(0, 10)
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
 
 function defaultStore() {
   const date = todayStr()
@@ -78,6 +89,246 @@ function loadStore() {
 function saveStore(store) {
   mkdirSync(dataDir, { recursive: true, mode: 0o700 })
   writeFileSync(storePath, JSON.stringify(store, null, 2) + '\n', { mode: 0o600 })
+}
+
+function loadGcalConfig() {
+  let fileCfg = {}
+  try {
+    if (existsSync(gcalConfigPath)) {
+      fileCfg = JSON.parse(readFileSync(gcalConfigPath, 'utf8'))
+    }
+  } catch {
+    fileCfg = {}
+  }
+  const accessToken = process.env.GCAL_ACCESS_TOKEN || fileCfg.accessToken || ''
+  const clientId = process.env.GCAL_CLIENT_ID || fileCfg.clientId || ''
+  const clientSecret = process.env.GCAL_CLIENT_SECRET || fileCfg.clientSecret || ''
+  const refreshToken = process.env.GCAL_REFRESH_TOKEN || fileCfg.refreshToken || ''
+  const clientEmail = process.env.GCAL_CLIENT_EMAIL || fileCfg.client_email || fileCfg.clientEmail || ''
+  const privateKey = process.env.GCAL_PRIVATE_KEY || fileCfg.private_key || fileCfg.privateKey || ''
+  const calendarId = process.env.GCAL_CALENDAR_ID || fileCfg.calendarId || 'primary'
+  const timeZone = process.env.GCAL_TIMEZONE || fileCfg.timeZone || 'Asia/Shanghai'
+  const tzOffset = process.env.GCAL_TZ_OFFSET || fileCfg.tzOffset || '+08:00'
+  const apiBase = (process.env.GCAL_API_BASE || fileCfg.apiBase || 'https://www.googleapis.com/calendar/v3').replace(/\/+$/, '')
+  const tokenEndpoint = process.env.GCAL_TOKEN_URI || fileCfg.token_uri || fileCfg.tokenEndpoint || 'https://oauth2.googleapis.com/token'
+  const enabled = Boolean(accessToken || (clientId && clientSecret && refreshToken) || (clientEmail && privateKey))
+  return {
+    enabled,
+    accessToken,
+    clientId,
+    clientSecret,
+    refreshToken,
+    clientEmail,
+    privateKey,
+    calendarId,
+    timeZone,
+    tzOffset,
+    apiBase,
+    tokenEndpoint,
+  }
+}
+
+/** Executes an HTTP fetch with exponential backoff + jitter on network failures, HTTP 429, and HTTP 5xx. */
+async function fetchWithRetry(url, init = {}, maxRetries = 3, baseDelayMs = 200) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await fetch(url, {
+        ...init,
+        signal: init.signal || AbortSignal.timeout(15_000),
+      })
+      if (res.status === 429 || (res.status >= 500 && res.status <= 599)) {
+        if (attempt < maxRetries) {
+          const retryAfter = Number(res.headers.get('retry-after') || 0)
+          const waitMs = retryAfter > 0
+            ? retryAfter * 1000
+            : Math.min(5000, baseDelayMs * (2 ** attempt) + Math.floor(Math.random() * 50))
+          await sleep(waitMs)
+          continue
+        }
+      }
+      return res
+    } catch (err) {
+      if (attempt < maxRetries) {
+        const waitMs = Math.min(5000, baseDelayMs * (2 ** attempt) + Math.floor(Math.random() * 50))
+        await sleep(waitMs)
+        continue
+      }
+      throw new Error(`Google Calendar network error after ${maxRetries + 1} attempts: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+}
+
+function createServiceAccountJwt(clientEmail, privateKey, tokenEndpoint) {
+  const now = Math.floor(Date.now() / 1000)
+  const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url')
+  const payload = Buffer.from(JSON.stringify({
+    iss: clientEmail,
+    scope: 'https://www.googleapis.com/auth/calendar',
+    aud: tokenEndpoint,
+    iat: now,
+    exp: now + 3600,
+  })).toString('base64url')
+  const unsigned = `${header}.${payload}`
+  const signer = createSign('RSA-SHA256')
+  signer.update(unsigned)
+  signer.end()
+  const signature = signer.sign(privateKey.replace(/\\n/g, '\n'), 'base64url')
+  return `${unsigned}.${signature}`
+}
+
+async function resolveAccessToken(cfg) {
+  if (cfg.accessToken) return cfg.accessToken
+  if (cfg.clientId && cfg.clientSecret && cfg.refreshToken) {
+    const body = new URLSearchParams({
+      client_id: cfg.clientId,
+      client_secret: cfg.clientSecret,
+      refresh_token: cfg.refreshToken,
+      grant_type: 'refresh_token',
+    })
+    const res = await fetchWithRetry(cfg.tokenEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok || !data.access_token) {
+      fail(res.status || 401, `Google OAuth2 refresh failed: ${data.error_description || data.error || res.statusText}`)
+    }
+    return data.access_token
+  }
+  if (cfg.clientEmail && cfg.privateKey) {
+    const assertion = createServiceAccountJwt(cfg.clientEmail, cfg.privateKey, cfg.tokenEndpoint)
+    const body = new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion,
+    })
+    const res = await fetchWithRetry(cfg.tokenEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok || !data.access_token) {
+      fail(res.status || 401, `Google Service Account auth failed: ${data.error_description || data.error || res.statusText}`)
+    }
+    return data.access_token
+  }
+  fail(401, 'No valid Google Calendar credentials configured')
+}
+
+function extractDateAndTime(dtObj, fallbackDate) {
+  if (!dtObj) return { date: fallbackDate, time: '00:00' }
+  if (dtObj.dateTime) {
+    // e.g. 2026-11-04T10:00:00+08:00 or 2026-11-04T02:00:00Z
+    const iso = String(dtObj.dateTime)
+    const match = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/.exec(iso)
+    if (match) return { date: match[1], time: match[2] }
+  }
+  if (dtObj.date) {
+    return { date: String(dtObj.date), time: '09:00' }
+  }
+  return { date: fallbackDate, time: '09:00' }
+}
+
+function normalizeGoogleEvent(item, fallbackDate) {
+  const startInfo = extractDateAndTime(item.start, fallbackDate)
+  const endInfo = extractDateAndTime(item.end, startInfo.date)
+  return {
+    id: String(item.id),
+    date: startInfo.date,
+    start: startInfo.time,
+    end: endInfo.time,
+    title: String(item.summary || '(无标题日程)'),
+    location: String(item.location || item.hangoutLink || '线上/待定'),
+    status: String(item.status || 'confirmed'),
+    ...(item.htmlLink ? { htmlLink: String(item.htmlLink) } : {}),
+  }
+}
+
+async function gcalListEvents(cfg, date) {
+  const token = await resolveAccessToken(cfg)
+  const timeMin = `${date}T00:00:00${cfg.tzOffset}`
+  const timeMax = `${date}T23:59:59${cfg.tzOffset}`
+  const params = new URLSearchParams({
+    timeMin,
+    timeMax,
+    singleEvents: 'true',
+    orderBy: 'startTime',
+  })
+  const url = `${cfg.apiBase}/calendars/${encodeURIComponent(cfg.calendarId)}/events?${params.toString()}`
+  const res = await fetchWithRetry(url, {
+    method: 'GET',
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    fail(res.status, `Google Calendar list error: ${data.error?.message || res.statusText}`)
+  }
+  return (data.items || [])
+    .filter(item => item.status !== 'cancelled')
+    .map(item => normalizeGoogleEvent(item, date))
+}
+
+async function gcalInsertEvent(cfg, draft) {
+  const token = await resolveAccessToken(cfg)
+  const url = `${cfg.apiBase}/calendars/${encodeURIComponent(cfg.calendarId)}/events`
+  const payload = {
+    summary: draft.title,
+    location: draft.location,
+    start: { dateTime: `${draft.date}T${draft.start}:00${cfg.tzOffset}`, timeZone: cfg.timeZone },
+    end: { dateTime: `${draft.date}T${draft.end}:00${cfg.tzOffset}`, timeZone: cfg.timeZone },
+  }
+  const res = await fetchWithRetry(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify(payload),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    fail(res.status, `Google Calendar insert error: ${data.error?.message || res.statusText}`, 'L3')
+  }
+  return normalizeGoogleEvent(data, draft.date)
+}
+
+async function gcalPatchEvent(cfg, eventId, date, start, end) {
+  const token = await resolveAccessToken(cfg)
+  const url = `${cfg.apiBase}/calendars/${encodeURIComponent(cfg.calendarId)}/events/${encodeURIComponent(eventId)}`
+  const payload = {
+    start: { dateTime: `${date}T${start}:00${cfg.tzOffset}`, timeZone: cfg.timeZone },
+    end: { dateTime: `${date}T${end}:00${cfg.tzOffset}`, timeZone: cfg.timeZone },
+  }
+  const res = await fetchWithRetry(url, {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify(payload),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    fail(res.status, `Google Calendar patch error: ${data.error?.message || res.statusText}`, 'L3')
+  }
+  return normalizeGoogleEvent(data, date)
+}
+
+async function gcalDeleteEvent(cfg, eventId) {
+  const token = await resolveAccessToken(cfg)
+  const url = `${cfg.apiBase}/calendars/${encodeURIComponent(cfg.calendarId)}/events/${encodeURIComponent(eventId)}`
+  const res = await fetchWithRetry(url, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  if (!res.ok && res.status !== 204) {
+    const data = await res.json().catch(() => ({}))
+    fail(res.status, `Google Calendar delete error: ${data.error?.message || res.statusText}`, 'L3')
+  }
+  return { id: eventId, deleted: true }
 }
 
 function parseArgs(argv) {
@@ -141,22 +392,37 @@ function requireL3Approval(flags, actionDesc) {
   return approvedBy
 }
 
-function main() {
+async function main() {
   const { cmd, flags } = parseArgs(process.argv)
   const store = loadStore()
+  const gcal = loadGcalConfig()
   const date = String(flags.date || todayStr())
 
   if (cmd === 'list') {
-    const events = store.events.filter(e => !flags.date || e.date === date)
+    const events = gcal.enabled
+      ? await gcalListEvents(gcal, date)
+      : store.events.filter(e => !flags.date || e.date === date)
     const drafts = store.drafts.filter(d => !flags.date || d.date === date)
     const conflicts = detectConflicts(events)
-    process.stdout.write(JSON.stringify({ date, events, drafts, conflicts }) + '\n')
+    process.stdout.write(JSON.stringify({
+      provider: gcal.enabled ? 'google-calendar' : 'local',
+      date,
+      events,
+      drafts,
+      conflicts,
+    }) + '\n')
     return
   }
 
   if (cmd === 'conflicts') {
-    const events = store.events.filter(e => !flags.date || e.date === date)
-    process.stdout.write(JSON.stringify({ date, conflicts: detectConflicts(events) }) + '\n')
+    const events = gcal.enabled
+      ? await gcalListEvents(gcal, date)
+      : store.events.filter(e => !flags.date || e.date === date)
+    process.stdout.write(JSON.stringify({
+      provider: gcal.enabled ? 'google-calendar' : 'local',
+      date,
+      conflicts: detectConflicts(events),
+    }) + '\n')
     return
   }
 
@@ -188,11 +454,22 @@ function main() {
     const idx = store.drafts.findIndex(d => d.id === draftId)
     if (idx < 0) fail(404, `Draft not found: ${draftId}`, 'L3')
     const [draft] = store.drafts.splice(idx, 1)
-    const event = { ...draft, id: `evt_${Date.now()}`, status: 'confirmed', approvedBy }
-    store.events.push(event)
+    let event
+    if (gcal.enabled) {
+      const created = await gcalInsertEvent(gcal, draft)
+      event = { ...created, approvedBy }
+    } else {
+      event = { ...draft, id: `evt_${Date.now()}`, status: 'confirmed', approvedBy }
+      store.events.push(event)
+    }
     store.auditLog.push({ at: new Date().toISOString(), action: 'commit-draft', target: event.id, approvedBy })
     saveStore(store)
-    process.stdout.write(JSON.stringify({ ok: true, tier: 'L3', event }) + '\n')
+    process.stdout.write(JSON.stringify({
+      ok: true,
+      tier: 'L3',
+      provider: gcal.enabled ? 'google-calendar' : 'local',
+      event,
+    }) + '\n')
     return
   }
 
@@ -202,6 +479,24 @@ function main() {
     const end = String(flags.end || '').trim()
     if (!eventId || !start || !end) fail(400, 'Usage: gcal-cli reschedule --event-id <id> --start <HH:MM> --end <HH:MM> --approved-by <confirmation>')
     const approvedBy = requireL3Approval(flags, `改期日程 ${eventId} 至 ${start}-${end}`)
+    if (gcal.enabled) {
+      const updated = await gcalPatchEvent(gcal, eventId, date, start, end)
+      store.auditLog.push({
+        at: new Date().toISOString(),
+        action: 'reschedule',
+        target: eventId,
+        next: { start, end, date },
+        approvedBy,
+      })
+      saveStore(store)
+      process.stdout.write(JSON.stringify({
+        ok: true,
+        tier: 'L3',
+        provider: 'google-calendar',
+        event: { ...updated, approvedBy },
+      }) + '\n')
+      return
+    }
     const event = store.events.find(e => e.id === eventId)
     if (!event) fail(404, `Event not found: ${eventId}`, 'L3')
     const previous = { start: event.start, end: event.end, date: event.date }
@@ -210,7 +505,7 @@ function main() {
     if (flags.date) event.date = String(flags.date)
     store.auditLog.push({ at: new Date().toISOString(), action: 'reschedule', target: eventId, previous, next: { start, end, date: event.date }, approvedBy })
     saveStore(store)
-    process.stdout.write(JSON.stringify({ ok: true, tier: 'L3', event, previous }) + '\n')
+    process.stdout.write(JSON.stringify({ ok: true, tier: 'L3', provider: 'local', event, previous }) + '\n')
     return
   }
 
@@ -218,12 +513,24 @@ function main() {
     const eventId = String(flags['event-id'] || '').trim()
     if (!eventId) fail(400, 'Usage: gcal-cli delete --event-id <id> --approved-by <confirmation>')
     const approvedBy = requireL3Approval(flags, `删除日程 ${eventId}`)
+    if (gcal.enabled) {
+      const removed = await gcalDeleteEvent(gcal, eventId)
+      store.auditLog.push({ at: new Date().toISOString(), action: 'delete', target: eventId, approvedBy })
+      saveStore(store)
+      process.stdout.write(JSON.stringify({
+        ok: true,
+        tier: 'L3',
+        provider: 'google-calendar',
+        deleted: removed,
+      }) + '\n')
+      return
+    }
     const idx = store.events.findIndex(e => e.id === eventId)
     if (idx < 0) fail(404, `Event not found: ${eventId}`, 'L3')
     const [removed] = store.events.splice(idx, 1)
     store.auditLog.push({ at: new Date().toISOString(), action: 'delete', target: eventId, removed, approvedBy })
     saveStore(store)
-    process.stdout.write(JSON.stringify({ ok: true, tier: 'L3', deleted: removed }) + '\n')
+    process.stdout.write(JSON.stringify({ ok: true, tier: 'L3', provider: 'local', deleted: removed }) + '\n')
     return
   }
 
@@ -264,4 +571,4 @@ function main() {
   fail(400, `Unknown gcal-cli subcommand: ${cmd}`)
 }
 
-main()
+main().catch(err => fail(500, err instanceof Error ? err.message : String(err)))

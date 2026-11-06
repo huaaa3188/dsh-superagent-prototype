@@ -1,0 +1,18 @@
+# Systemd timer running dsh-superagent-check.service every 5 minutes.
+#
+# Enable with:
+#   cp examples/dsh-superagent-check.* ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now dsh-superagent-check.timer
+
+[Unit]
+Description=Periodic Health Check Timer for dsh-superagent
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=15s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

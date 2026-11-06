@@ -57,22 +57,49 @@ function fail(code, message) {
   process.exit(1)
 }
 
-async function tgApi(token, method, body) {
-  const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-  const data = await res.json().catch(() => ({ ok: false, error_code: res.status, description: res.statusText }))
-  if (!data.ok) {
-    const code = data.error_code || res.status || 500
-    const desc = data.description || 'Telegram API error'
-    if (code === 403 || (code === 400 && /chat not found|user is deactivated|message thread not found/i.test(desc))) {
-      fail(410, desc)
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+async function tgApi(token, method, body, options = {}) {
+  const maxRetries = options.retries ?? 3
+  const timeoutMs = options.timeoutMs ?? 35_000
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(timeoutMs),
+      })
+      const data = await res.json().catch(() => ({ ok: false, error_code: res.status, description: res.statusText }))
+      if (data.ok) return data.result
+
+      const code = data.error_code || res.status || 500
+      const desc = data.description || 'Telegram API error'
+      if (code === 403 || (code === 400 && /chat not found|user is deactivated|message thread not found/i.test(desc))) {
+        fail(410, desc)
+      }
+      if (options.returnErrorOn400 && code === 400) {
+        return { __error: true, code, description: desc }
+      }
+      const retryable = code === 429 || code === 500 || code === 502 || code === 503 || code === 504
+      if (retryable && attempt < maxRetries) {
+        const retryAfterSec = data.parameters && Number(data.parameters.retry_after)
+        const waitMs = retryAfterSec > 0 ? retryAfterSec * 1000 : Math.min(8000, 500 * (2 ** attempt))
+        await sleep(waitMs)
+        continue
+      }
+      fail(code, desc)
+    } catch (err) {
+      if (attempt < maxRetries) {
+        const waitMs = Math.min(8000, 500 * (2 ** attempt))
+        await sleep(waitMs)
+        continue
+      }
+      fail(503, `Telegram network error after ${maxRetries + 1} attempts: ${err instanceof Error ? err.message : String(err)}`)
     }
-    fail(code, desc)
   }
-  return data.result
 }
 
 function extractButtons(markdown) {
@@ -286,19 +313,15 @@ async function main() {
         ...(flags['thread-id'] && /^\d+$/.test(String(flags['thread-id'])) ? { message_thread_id: Number(flags['thread-id']) } : {}),
         ...(keyboard ? { reply_markup: keyboard } : {}),
       }
-      let res
-      const trySend = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...basePayload, parse_mode: 'Markdown' }),
-      }).then(r => r.json()).catch(() => ({ ok: false }))
-      if (trySend.ok) {
-        res = trySend.result
-      } else if (trySend.error_code === 400 && /can't parse entities/i.test(trySend.description || '')) {
-        res = await tgApi(token, 'sendMessage', basePayload)
-      } else {
-        res = await tgApi(token, 'sendMessage', basePayload)
-      }
+      const trySend = await tgApi(
+        token,
+        'sendMessage',
+        { ...basePayload, parse_mode: 'Markdown' },
+        { returnErrorOn400: true },
+      )
+      const res = trySend && trySend.__error
+        ? await tgApi(token, 'sendMessage', basePayload)
+        : trySend
       sentMsgId = String(res.message_id)
     }
     const rootId = (state.messageRoots && state.messageRoots[`${chatId}:${to}`]) || to

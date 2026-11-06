@@ -17,8 +17,11 @@ const exec = promisify(execFile)
 let dir: string
 const program = (path: string, body: string): string => { writeFileSync(path, `#!/bin/sh\n${body}\n`); chmodSync(path, 0o755); return path }
 /** Worker shell environment after DSH strips credential-shaped variables. */
-const workerEnv = (env: Record<string, string | undefined>): Record<string, string> =>
-  Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined && !SENSITIVE_ENV_PATTERN.test(entry[0])))
+const workerEnv = (env: Record<string, string | undefined>): Record<string, string> => ({
+  ...Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined && !SENSITIVE_ENV_PATTERN.test(entry[0]))),
+  LC_ALL: 'C',
+  LANG: 'C',
+})
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'environment-')); mkdirSync(join(dir, 'real')) })
 afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
 

@@ -555,11 +555,54 @@ dsh plugin --profile superagent add "link:$PWD"
    ln -sfn /home/ubuntu/.local/share/dsh-superagent/knowledge "$DSH_SUPERAGENT_DIR/knowledge"
    ```
 
-### 4.4 自愈守护（复用官方 Hourly Check）
+### 4.4 生产守护与容器化部署（`systemd` / `Docker` / `tmux`）
 
-无需额外引入 `pm2` 破坏 DSH 的内部锁与 tmux 生命周期管理，直接按 [`006-deployment.md` Hourly check](../006-deployment.md#L133-L141) 配置每小时巡检：
-* `scripts/dsh-superagent status` 返回 `0` 时静默；
-* 返回 `1`（进程异常退出或无响应）时自动执行 `scripts/dsh-superagent --profile superagent --respect-stop restart` 恢复服务并重连中断的 Assignments。
+工程同时提供三种开箱即用的生产级守护方案：
+
+1. **方案 A：`systemd` 原生前台守护（云主机首选）**
+   * 使用 [`examples/dsh-superagent.service`](../../examples/dsh-superagent.service) 直接托管前台进程 `dsh --profile superagent --no-open`，支持崩溃 5 秒自动拉起（`Restart=on-failure`）以及 `SIGINT` + `TimeoutStopSec=300` 优雅停机（确保正在运行的 Worker Session 先完成当前 Step）：
+     ```bash
+     loginctl enable-linger "$USER"
+     mkdir -p ~/.config/systemd/user
+     cp examples/dsh-superagent.service ~/.config/systemd/user/
+     systemctl --user daemon-reload
+     systemctl --user enable --now dsh-superagent.service
+     ```
+2. **方案 B：`tmux` + `systemd.timer` 自愈巡检（适合交互调试与热挂接）**
+   * 使用 [`examples/dsh-superagent-check.service`](../../examples/dsh-superagent-check.service) 与 [`examples/dsh-superagent-check.timer`](../../examples/dsh-superagent-check.timer) 每 5 分钟探测 `/orchestrator/api/state`：
+     * `scripts/dsh-superagent status` 返回 `0` 时静默；
+     * 返回 `1`（进程异常退出或无响应）时自动执行 `scripts/dsh-superagent --profile superagent --respect-stop restart` 恢复服务并重连中断的 Assignments。
+3. **方案 C：Docker / Docker Compose 一键容器化部署**
+   * 使用仓库根目录 [`Dockerfile`](../../Dockerfile) 与 [`examples/docker-compose.yml`](../../examples/docker-compose.yml) 一键构建并持久化挂载 `/root/.dsh` 与 `/root/.config`：
+     ```bash
+     docker compose -f examples/docker-compose.yml up -d --build
+     ```
+
+### 4.5 真实 Google Calendar REST API 与 IMAP/SMTP 接入配置
+
+`scripts/aura-cli/gcal-cli` 与 `scripts/aura-cli/mail-cli` 支持**真实云端 API + 本地 JSON 双模自动切换**，且内置网络抖动指数退避重试（Exponential Backoff + Jitter）：
+
+1. **Google Calendar REST API v3 (`~/.config/aura-agent/gcal.json`)**：
+   * 支持 OAuth2 Refresh Token、Access Token 或 Google Service Account（原生 `node:crypto` RS256 JWT 签名，零外部 SDK 依赖）：
+     ```json
+     {
+       "clientId": "YOUR_CLIENT_ID.apps.googleusercontent.com",
+       "clientSecret": "YOUR_CLIENT_SECRET",
+       "refreshToken": "YOUR_REFRESH_TOKEN",
+       "calendarId": "primary",
+       "timeZone": "Asia/Shanghai",
+       "tzOffset": "+08:00"
+     }
+     ```
+2. **IMAP4rev1 / SMTP 邮件客户端 (`~/.config/aura-agent/mail.json`)**：
+   * 基于 Node.js 原生 `node:tls` / `node:net` 实现 IMAP4rev1（`UID SEARCH UNSEEN` / `UID FETCH` / MIME UTF-8 解码）与 SMTP（`AUTH PLAIN` / RFC 5322 UTF-8 Base64 投递），L2 草稿保存在本地，L3 外发/删除强制校验 `--approved-by`：
+     ```json
+     {
+       "imap": { "host": "imap.gmail.com", "port": 993, "tls": true, "user": "you@gmail.com", "pass": "APP_PASSWORD" },
+       "smtp": { "host": "smtp.gmail.com", "port": 465, "tls": true, "user": "you@gmail.com", "pass": "APP_PASSWORD", "from": "you@gmail.com" }
+     }
+     ```
+   * 未配置上述云端凭据时，自动回退至 `<stateDir>/aura-data/` 下的本地持久化存储，确保离线开发与单元测试零外部依赖。
 
 ---
 

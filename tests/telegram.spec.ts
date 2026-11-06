@@ -1,9 +1,14 @@
 import type { Context } from '@deepseek-ai/cordis'
-import { execFileSync } from 'node:child_process'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { execFile, execFileSync } from 'node:child_process'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import http from 'node:http'
+import net from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { promisify } from 'node:util'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+
+const execFileAsync = promisify(execFile)
 import { sourceContextOf, type SourceContextDeps } from '../src/app/source-context.ts'
 import { Store } from '../src/app/store.ts'
 import { Engine, type OutboundMessage, type Trigger } from '../src/core/index.ts'
@@ -13,6 +18,7 @@ import { KV } from '../src/kv.ts'
 import { SettingsSchema, settingsPolicy } from '../src/policy.ts'
 import { SourceRegistry } from '../src/sources/registry.ts'
 import {
+  TELEGRAM_MAX_BACKOFF_MS,
   TelegramItemSchema,
   apply as applyTelegram,
   pollTelegram,
@@ -20,9 +26,11 @@ import {
   telegramChannel,
   telegramKind,
   telegramLink,
+  telegramPollDelay,
   telegramTime,
   telegramTrigger,
   telegramTriggerId,
+  watchTelegram,
   type TelegramItem,
 } from '../src/sources/telegram.ts'
 import { testDeployment } from './fixtures/deployment.ts'
@@ -482,5 +490,271 @@ describe('Telegram Source', () => {
 
     const readRes = run(kbPath, ['read', '--path', saved.entry.relPath])
     expect(readRes.content).toContain('核心结论：结构化 Markdown 归档')
+  })
+
+  it('computes exponential backoff in telegramPollDelay and reports pollFailures after 3 consecutive errors in watchTelegram', async () => {
+    expect(telegramPollDelay(5, 0)).toBe(5_000)
+    expect(telegramPollDelay(5, 1)).toBe(10_000)
+    expect(telegramPollDelay(5, 2)).toBe(20_000)
+    expect(telegramPollDelay(5, 3)).toBe(40_000)
+    expect(telegramPollDelay(10, 10)).toBe(TELEGRAM_MAX_BACKOFF_MS)
+
+    const h = host()
+    const controller = new AbortController()
+    let callCount = 0
+    vi.spyOn(h.commands, 'withSignal').mockReturnValue(h.commands)
+    vi.spyOn(h.commands, 'run').mockImplementation(async () => {
+      callCount += 1
+      if (callCount <= 3) {
+        throw new Error(`Telegram poll timeout #${callCount}`)
+      }
+      controller.abort()
+      return JSON.stringify({ me: BOT_ID, items: [], next: 1 })
+    })
+    // Speed up pollSeconds to minimum and abort on 4th call
+    vi.spyOn(h.ctx, 'config').mockReturnValue({ chats: [], directMessages: true, pollSeconds: 0.005 as unknown as number })
+
+    const watching = watchTelegram(h.ctx, controller.signal)
+    await vi.waitFor(() => expect(callCount).toBeGreaterThanOrEqual(3), { timeout: 2000 })
+    expect(h.health.telegram).toMatchObject({ state: 'error', code: 'pollFailures' })
+    controller.abort()
+    await watching
+    h.store.close()
+  })
+
+  it('connects gcal-cli to a real Google Calendar REST v3 endpoint with OAuth2 token refresh and 503 network jitter retry', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'aura-gcal-api-'))
+    tempDirs.push(dataDir)
+    const gcalPath = resolve(import.meta.dirname, '../scripts/aura-cli/gcal-cli')
+
+    let listAttempts = 0
+    const remoteEvents = [
+      {
+        id: 'gcal_remote_1',
+        summary: 'Google Calendar 云端架构会',
+        location: 'Google Meet',
+        status: 'confirmed',
+        start: { dateTime: '2026-11-07T10:00:00+08:00' },
+        end: { dateTime: '2026-11-07T11:30:00+08:00' },
+      },
+      {
+        id: 'gcal_remote_2',
+        summary: '云端冲突会议',
+        location: 'Zoom',
+        status: 'confirmed',
+        start: { dateTime: '2026-11-07T11:00:00+08:00' },
+        end: { dateTime: '2026-11-07T12:00:00+08:00' },
+      },
+    ]
+
+    const server = http.createServer((req, res) => {
+      let body = ''
+      req.on('data', chunk => { body += chunk })
+      req.on('end', () => {
+        if (req.url === '/token' && req.method === 'POST') {
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ access_token: 'mock_oauth_access_token', expires_in: 3600 }))
+          return
+        }
+        if (req.url?.startsWith('/calendar/v3/calendars/primary/events') && req.method === 'GET') {
+          listAttempts += 1
+          if (listAttempts === 1) {
+            // Simulate transient 503 network jitter on first attempt
+            res.writeHead(503, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ error: { message: 'Backend transient error' } }))
+            return
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ items: remoteEvents }))
+          return
+        }
+        if (req.url === '/calendar/v3/calendars/primary/events' && req.method === 'POST') {
+          const parsed = JSON.parse(body)
+          const created = {
+            id: 'gcal_created_99',
+            summary: parsed.summary,
+            location: parsed.location,
+            status: 'confirmed',
+            start: parsed.start,
+            end: parsed.end,
+          }
+          remoteEvents.push(created)
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify(created))
+          return
+        }
+        res.writeHead(404).end()
+      })
+    })
+
+    await new Promise<void>(resolveListen => server.listen(0, '127.0.0.1', () => resolveListen()))
+    const port = (server.address() as net.AddressInfo).port
+    const configFile = join(dataDir, 'gcal-config.json')
+    writeFileSync(configFile, JSON.stringify({
+      clientId: 'test-client-id',
+      clientSecret: 'test-client-secret',
+      refreshToken: 'test-refresh-token',
+      calendarId: 'primary',
+      apiBase: `http://127.0.0.1:${port}/calendar/v3`,
+      tokenEndpoint: `http://127.0.0.1:${port}/token`,
+    }))
+
+    const runGcal = async (args: string[]) => {
+      const { stdout } = await execFileAsync(process.execPath, [gcalPath, ...args], {
+        env: { ...process.env, AURA_DATA_DIR: dataDir, AURA_GCAL_CONFIG: configFile },
+        encoding: 'utf8',
+      })
+      return JSON.parse(stdout)
+    }
+
+    try {
+      const listed = await runGcal(['list', '--date', '2026-11-07'])
+      expect(listAttempts).toBe(2) // Proves 503 retry succeeded
+      expect(listed.provider).toBe('google-calendar')
+      expect(listed.events).toHaveLength(2)
+      expect(listed.conflicts).toHaveLength(1)
+      expect(listed.conflicts[0].overlapMinutes).toBe(30)
+
+      const draft = await runGcal(['draft-add', '--date', '2026-11-07', '--title', '新增云端日程', '--start', '15:00', '--end', '16:00'])
+      const committed = await runGcal(['commit-draft', '--draft-id', draft.draft.id, '--approved-by', 'approve:commit_1'])
+      expect(committed).toMatchObject({
+        ok: true,
+        tier: 'L3',
+        provider: 'google-calendar',
+        event: { id: 'gcal_created_99', title: '新增云端日程' },
+      })
+    } finally {
+      server.close()
+    }
+  })
+
+  it('connects mail-cli to real IMAP4rev1 and SMTP servers with MIME UTF-8 decoding and L3 approval', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'aura-mail-api-'))
+    tempDirs.push(dataDir)
+    const mailPath = resolve(import.meta.dirname, '../scripts/aura-cli/mail-cli')
+
+    const smtpReceived: string[] = []
+
+    // Minimal mock IMAP4rev1 server
+    const imapServer = net.createServer(socket => {
+      socket.write('* OK IMAP4rev1 Mock Ready\r\n')
+      let buf = ''
+      socket.on('data', chunk => {
+        buf += chunk.toString('utf8')
+        const lines = buf.split('\r\n')
+        buf = lines.pop() ?? ''
+        for (const line of lines) {
+          const [tag, cmd, ...rest] = line.split(' ')
+          const argStr = rest.join(' ')
+          if (cmd === 'LOGIN') {
+            socket.write(`${tag} OK LOGIN completed\r\n`)
+          } else if (cmd === 'SELECT') {
+            socket.write(`* 1 EXISTS\r\n${tag} OK [READ-WRITE] SELECT completed\r\n`)
+          } else if (cmd === 'UID' && argStr.startsWith('SEARCH UNSEEN')) {
+            socket.write(`* SEARCH 501\r\n${tag} OK UID SEARCH completed\r\n`)
+          } else if (cmd === 'UID' && argStr.startsWith('FETCH 501')) {
+            const subjB64 = Buffer.from('[重要] 真实 IMAP 账单通知', 'utf8').toString('base64')
+            socket.write(
+              `* 1 FETCH (UID 501 FLAGS () BODY[HEADER.FIELDS (FROM SUBJECT DATE)] {120}\r\n` +
+              `From: billing@real-imap.example.com\r\n` +
+              `Subject: =?UTF-8?B?${subjB64}?=\r\n` +
+              `Date: Sat, 07 Nov 2026 08:00:00 +0800\r\n\r\n` +
+              `请尽快核对本月账单明细。)\r\n` +
+              `${tag} OK UID FETCH completed\r\n`,
+            )
+          } else if (cmd === 'LOGOUT') {
+            socket.write(`* BYE IMAP4rev1 logging out\r\n${tag} OK LOGOUT completed\r\n`)
+          }
+        }
+      })
+    })
+
+    // Minimal mock SMTP server
+    const smtpServer = net.createServer(socket => {
+      socket.write('220 smtp.example.com ESMTP ready\r\n')
+      let inData = false
+      let dataBuf = ''
+      let buf = ''
+      socket.on('data', chunk => {
+        buf += chunk.toString('utf8')
+        const lines = buf.split('\r\n')
+        buf = lines.pop() ?? ''
+        for (const line of lines) {
+          if (inData) {
+            if (line === '.') {
+              inData = false
+              smtpReceived.push(dataBuf)
+              socket.write('250 2.0.0 OK queued\r\n')
+            } else {
+              dataBuf += line + '\n'
+            }
+            continue
+          }
+          if (/^EHLO/i.test(line)) socket.write('250-smtp.example.com\r\n250 AUTH PLAIN LOGIN\r\n')
+          else if (/^AUTH PLAIN/i.test(line)) socket.write('235 2.7.0 Authentication successful\r\n')
+          else if (/^MAIL FROM/i.test(line)) socket.write('250 2.1.0 Originator OK\r\n')
+          else if (/^RCPT TO/i.test(line)) socket.write('250 2.1.5 Recipient OK\r\n')
+          else if (/^DATA/i.test(line)) {
+            inData = true
+            socket.write('354 End data with <CR><LF>.<CR><LF>\r\n')
+          } else if (/^QUIT/i.test(line)) {
+            socket.write('221 2.0.0 Bye\r\n')
+          }
+        }
+      })
+    })
+
+    await new Promise<void>(r => imapServer.listen(0, '127.0.0.1', () => r()))
+    await new Promise<void>(r => smtpServer.listen(0, '127.0.0.1', () => r()))
+    const imapPort = (imapServer.address() as net.AddressInfo).port
+    const smtpPort = (smtpServer.address() as net.AddressInfo).port
+
+    const mailCfgPath = join(dataDir, 'mail-config.json')
+    writeFileSync(mailCfgPath, JSON.stringify({
+      imap: { host: '127.0.0.1', port: imapPort, tls: false, user: 'aura@example.com', pass: 'secret' },
+      smtp: { host: '127.0.0.1', port: smtpPort, tls: false, user: 'aura@example.com', pass: 'secret', from: 'aura@example.com' },
+    }))
+
+    const runMail = async (args: string[]) => {
+      const { stdout } = await execFileAsync(process.execPath, [mailPath, ...args], {
+        env: { ...process.env, AURA_DATA_DIR: dataDir, AURA_MAIL_CONFIG: mailCfgPath },
+        encoding: 'utf8',
+      })
+      return JSON.parse(stdout)
+    }
+
+    try {
+      const unread = await runMail(['unread'])
+      expect(unread.provider).toBe('imap')
+      expect(unread.count).toBe(1)
+      expect(unread.items[0]).toMatchObject({
+        id: 'imap_501',
+        from: 'billing@real-imap.example.com',
+        subject: '[重要] 真实 IMAP 账单通知',
+        priority: 'high',
+      })
+
+      const draft = await runMail([
+        'draft',
+        '--to', 'billing@real-imap.example.com',
+        '--subject', 'Re: 真实 IMAP 账单通知',
+        '--body', '已确认账单无误，请按期扣款。',
+      ])
+      const sent = await runMail([
+        'send',
+        '--draft-id', draft.draft.id,
+        '--approved-by', 'approve:smtp_send_1',
+      ])
+      expect(sent).toMatchObject({
+        ok: true,
+        tier: 'L3',
+        provider: 'smtp',
+      })
+      expect(smtpReceived).toHaveLength(1)
+      expect(smtpReceived[0]).toContain('To: billing@real-imap.example.com')
+    } finally {
+      imapServer.close()
+      smtpServer.close()
+    }
   })
 })

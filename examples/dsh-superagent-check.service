@@ -1,0 +1,13 @@
+# Systemd oneshot service paired with dsh-superagent-check.timer for tmux-mode deployments.
+# Probes `/orchestrator/api/state` via `scripts/dsh-superagent status` and restarts only when
+# exit code is 1 (stopped/unreachable/runtime error) while respecting intentional manual stops.
+
+[Unit]
+Description=dsh-superagent Health Probe and Auto-Recovery (tmux mode)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/dsh-superagent-prototype
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/bin/sh -c './scripts/dsh-superagent --profile superagent status >/dev/null || [ $? -ne 1 ] || ./scripts/dsh-superagent --profile superagent --respect-stop restart'

@@ -1,0 +1,25 @@
+# Docker Compose deployment example for dsh-superagent (Project Aura)
+# Usage:
+#   docker compose -f examples/docker-compose.yml up -d --build
+
+services:
+  dsh-superagent:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: dsh-superagent
+    restart: unless-stopped
+    stop_grace_period: 5m
+    ports:
+      - "127.0.0.1:3082:3082"
+    environment:
+      - DSH_SUPERAGENT_PROFILE=superagent
+      - DSH_SUPERAGENT_URL=http://127.0.0.1:3082
+      - TZ=Asia/Shanghai
+    volumes:
+      - dsh-data:/root/.dsh
+      - aura-config:/root/.config
+
+volumes:
+  dsh-data:
+  aura-config:

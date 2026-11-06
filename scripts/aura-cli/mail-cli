@@ -2,12 +2,17 @@
 /**
  * mail-cli: Controlled Email & Inbox CLI for Project Aura (dsh-superagent).
  *
+ * Supports dual backends:
+ *   1. Real IMAP4rev1 & SMTP (over native node:tls / node:net) with exponential backoff retry
+ *      on network jitter, socket timeouts, and transient 4xx SMTP errors.
+ *   2. Local JSON store fallback (<AURA_DATA_DIR>/mail-inbox.json) when no IMAP/SMTP credentials are set.
+ *
  * Permission Tiers:
  *   L1 (Read-only):
  *     mail-cli unread [--limit <n>]
  *     mail-cli read --id <msgId>
  *     mail-cli search --query <keyword>
- *   L2 (Reversible Drafts):
+ *   L2 (Reversible Drafts — stored locally prior to L3 approval):
  *     mail-cli draft --to <email> --subject <text> --body <text> [--reply-to <msgId>]
  *     mail-cli drafts
  *   L3 (External Send / Irreversible Delete — requires human approval token/confirmation):
@@ -15,11 +20,18 @@
  *     mail-cli delete --id <msgId> --approved-by <triggerOrCallback>
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import net from 'node:net'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import tls from 'node:tls'
 
 const dataDir = process.env.AURA_DATA_DIR || join(homedir(), '.dsh', 'state', 'superagent', 'aura-data')
 const storePath = join(dataDir, 'mail-inbox.json')
+const mailConfigPath = process.env.AURA_MAIL_CONFIG || join(homedir(), '.config', 'aura-agent', 'mail.json')
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
 
 function defaultStore() {
   return {
@@ -62,6 +74,350 @@ function saveStore(store) {
   writeFileSync(storePath, JSON.stringify(store, null, 2) + '\n', { mode: 0o600 })
 }
 
+function loadMailConfig() {
+  let fileCfg = {}
+  try {
+    if (existsSync(mailConfigPath)) {
+      fileCfg = JSON.parse(readFileSync(mailConfigPath, 'utf8'))
+    }
+  } catch {
+    fileCfg = {}
+  }
+  const imapCfg = fileCfg.imap || {}
+  const smtpCfg = fileCfg.smtp || {}
+
+  const imapHost = process.env.AURA_IMAP_HOST || imapCfg.host || fileCfg.imapHost || ''
+  const imapPort = Number(process.env.AURA_IMAP_PORT || imapCfg.port || fileCfg.imapPort || 993)
+  const imapTls = (process.env.AURA_IMAP_TLS ?? String(imapCfg.tls ?? fileCfg.imapTls ?? 'true')) !== 'false'
+  const imapUser = process.env.AURA_IMAP_USER || process.env.AURA_MAIL_USER || imapCfg.user || fileCfg.user || ''
+  const imapPass = process.env.AURA_IMAP_PASS || process.env.AURA_MAIL_PASS || imapCfg.pass || fileCfg.pass || ''
+
+  const smtpHost = process.env.AURA_SMTP_HOST || smtpCfg.host || fileCfg.smtpHost || ''
+  const smtpPort = Number(process.env.AURA_SMTP_PORT || smtpCfg.port || fileCfg.smtpPort || 465)
+  const smtpTls = (process.env.AURA_SMTP_TLS ?? String(smtpCfg.tls ?? fileCfg.smtpTls ?? 'true')) !== 'false'
+  const smtpUser = process.env.AURA_SMTP_USER || process.env.AURA_MAIL_USER || smtpCfg.user || fileCfg.user || ''
+  const smtpPass = process.env.AURA_SMTP_PASS || process.env.AURA_MAIL_PASS || smtpCfg.pass || fileCfg.pass || ''
+  const smtpFrom = process.env.AURA_MAIL_FROM || smtpCfg.from || fileCfg.from || smtpUser
+
+  return {
+    imap: {
+      enabled: Boolean(imapHost && imapUser && imapPass),
+      host: imapHost,
+      port: imapPort,
+      tls: imapTls,
+      user: imapUser,
+      pass: imapPass,
+      rejectUnauthorized: imapCfg.rejectUnauthorized !== false,
+    },
+    smtp: {
+      enabled: Boolean(smtpHost && smtpUser && smtpPass),
+      host: smtpHost,
+      port: smtpPort,
+      tls: smtpTls,
+      user: smtpUser,
+      pass: smtpPass,
+      from: smtpFrom,
+      rejectUnauthorized: smtpCfg.rejectUnauthorized !== false,
+    },
+  }
+}
+
+/** Retries an async network operation with exponential backoff + jitter. */
+async function withRetry(fn, maxRetries = 3, baseDelayMs = 200) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn()
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      const permanentAuth = /AUTH_FAILED|535 |Invalid credentials|AUTHENTICATIONFAILED/i.test(msg)
+      if (permanentAuth || attempt >= maxRetries) {
+        throw err
+      }
+      const waitMs = Math.min(4000, baseDelayMs * (2 ** attempt) + Math.floor(Math.random() * 50))
+      await sleep(waitMs)
+    }
+  }
+}
+
+function decodeMimeWords(str) {
+  if (!str) return ''
+  return String(str).replace(/=\?([^?]+)\?([BbQq])\?([^?]*)\?=/g, (_, charset, encoding, text) => {
+    try {
+      if (encoding.toUpperCase() === 'B') {
+        return Buffer.from(text, 'base64').toString('utf8')
+      }
+      const qp = text.replace(/_/g, ' ').replace(/=([0-9A-Fa-f]{2})/g, (__, hex) => String.fromCharCode(parseInt(hex, 16)))
+      return Buffer.from(qp, 'binary').toString('utf8')
+    } catch {
+      return text
+    }
+  })
+}
+
+function quoteImapString(val) {
+  return `"${String(val).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+}
+
+function createLineSocket(cfg) {
+  return new Promise((resolve, reject) => {
+    const onConnect = () => {
+      socket.setTimeout(12_000)
+      resolve(socket)
+    }
+    const socket = cfg.tls
+      ? tls.connect({
+          host: cfg.host,
+          port: cfg.port,
+          servername: cfg.host,
+          rejectUnauthorized: cfg.rejectUnauthorized,
+        }, onConnect)
+      : net.connect({ host: cfg.host, port: cfg.port }, onConnect)
+
+    socket.once('error', reject)
+    socket.once('timeout', () => {
+      socket.destroy(new Error(`Socket timeout connecting to ${cfg.host}:${cfg.port}`))
+    })
+  })
+}
+
+async function withImapClient(imapCfg, handler) {
+  return withRetry(async () => {
+    const socket = await createLineSocket(imapCfg)
+    let buffer = ''
+    let waiter = null
+    let seq = 1
+
+    const checkWaiter = () => {
+      if (!waiter) return
+      if (waiter.type === 'greeting') {
+        const idx = buffer.indexOf('\r\n')
+        if (idx >= 0) {
+          const line = buffer.slice(0, idx)
+          buffer = buffer.slice(idx + 2)
+          const w = waiter
+          waiter = null
+          if (/^\* (OK|PREAUTH)/i.test(line)) w.resolve(line)
+          else w.reject(new Error(`IMAP greeting error: ${line}`))
+        }
+        return
+      }
+      if (waiter.type === 'tag') {
+        const re = new RegExp(`^${waiter.tag} (OK|NO|BAD) (.*)$`, 'm')
+        const match = re.exec(buffer)
+        if (match) {
+          const endIdx = match.index + match[0].length
+          const fullResponse = buffer.slice(0, endIdx)
+          buffer = buffer.slice(endIdx).replace(/^\r?\n/, '')
+          const w = waiter
+          waiter = null
+          if (match[1].toUpperCase() === 'OK') {
+            w.resolve(fullResponse)
+          } else {
+            w.reject(new Error(`IMAP ${match[1]}: ${match[2]}`))
+          }
+        }
+      }
+    }
+
+    socket.on('data', chunk => {
+      buffer += chunk.toString('utf8')
+      checkWaiter()
+    })
+
+    const waitGreeting = () => new Promise((resolve, reject) => {
+      waiter = { type: 'greeting', resolve, reject }
+      socket.once('error', reject)
+      checkWaiter()
+    })
+
+    const sendCommand = cmdText => new Promise((resolve, reject) => {
+      const tag = `A${String(seq++).padStart(3, '0')}`
+      waiter = { type: 'tag', tag, resolve, reject }
+      socket.write(`${tag} ${cmdText}\r\n`)
+      checkWaiter()
+    })
+
+    try {
+      await waitGreeting()
+      await sendCommand(`LOGIN ${quoteImapString(imapCfg.user)} ${quoteImapString(imapCfg.pass)}`)
+      await sendCommand('SELECT INBOX')
+      const result = await handler(sendCommand)
+      await sendCommand('LOGOUT').catch(() => {})
+      socket.end()
+      return result
+    } catch (err) {
+      socket.destroy()
+      throw err
+    }
+  })
+}
+
+function parseImapFetchBlock(raw, uid, defaultUnread = true) {
+  const fromMatch = /^From:\s*(.+)$/im.exec(raw)
+  const subjectMatch = /^Subject:\s*(.+)$/im.exec(raw)
+  const dateMatch = /^Date:\s*(.+)$/im.exec(raw)
+  const seenFlag = /FLAGS\s*\([^)]*\\Seen[^)]*\)/i.test(raw)
+  const from = decodeMimeWords(fromMatch ? fromMatch[1].trim() : 'unknown@sender')
+  const subject = decodeMimeWords(subjectMatch ? subjectMatch[1].trim() : '(无主题)')
+  const rawDate = dateMatch ? Date.parse(dateMatch[1].trim()) : NaN
+  const receivedAt = Number.isFinite(rawDate) ? new Date(rawDate).toISOString() : new Date().toISOString()
+
+  // Extract body lines after blank line inside FETCH literal
+  const parts = raw.split(/\r?\n\r?\n/)
+  let body = ''
+  if (parts.length > 1) {
+    body = parts
+      .slice(1)
+      .join('\n\n')
+      .replace(/\)\s*\r?\nA\d+\s+OK[\s\S]*$/i, '')
+      .replace(/\)\s*$/, '')
+      .trim()
+  }
+  const priority = /重要|紧急|urgent|billing|账单|invoice|alert/i.test(`${subject} ${body}`) ? 'high' : 'normal'
+  return {
+    id: `imap_${uid}`,
+    uid: String(uid),
+    from,
+    subject,
+    receivedAt,
+    unread: seenFlag ? false : defaultUnread,
+    priority,
+    body: body || subject,
+  }
+}
+
+async function imapFetchMessagesByUids(sendCommand, uids, defaultUnread = true) {
+  const items = []
+  for (const uid of uids) {
+    const raw = await sendCommand(
+      `UID FETCH ${uid} (UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)] BODY.PEEK[TEXT]<0.2048>)`,
+    )
+    items.push(parseImapFetchBlock(raw, uid, defaultUnread))
+  }
+  return items
+}
+
+async function imapListUnread(imapCfg, limit = 20) {
+  return withImapClient(imapCfg, async sendCommand => {
+    const searchRaw = await sendCommand('UID SEARCH UNSEEN')
+    const match = /^\* SEARCH(?:\s+([0-9\s]+))?/m.exec(searchRaw)
+    const uids = match && match[1]
+      ? match[1].trim().split(/\s+/).filter(Boolean).slice(-limit).reverse()
+      : []
+    return imapFetchMessagesByUids(sendCommand, uids, true)
+  })
+}
+
+async function imapReadMessage(imapCfg, id) {
+  const uid = String(id).replace(/^imap_/, '')
+  if (!/^\d+$/.test(uid)) return null
+  return withImapClient(imapCfg, async sendCommand => {
+    const items = await imapFetchMessagesByUids(sendCommand, [uid], false)
+    return items[0] || null
+  })
+}
+
+async function imapSearchMessages(imapCfg, query) {
+  return withImapClient(imapCfg, async sendCommand => {
+    const searchRaw = await sendCommand(`UID SEARCH TEXT ${quoteImapString(query)}`)
+    const match = /^\* SEARCH(?:\s+([0-9\s]+))?/m.exec(searchRaw)
+    const uids = match && match[1]
+      ? match[1].trim().split(/\s+/).filter(Boolean).slice(-20).reverse()
+      : []
+    return imapFetchMessagesByUids(sendCommand, uids, false)
+  })
+}
+
+async function imapDeleteMessage(imapCfg, id) {
+  const uid = String(id).replace(/^imap_/, '')
+  if (!/^\d+$/.test(uid)) fail(400, `Invalid IMAP message UID: ${id}`, 'L3')
+  return withImapClient(imapCfg, async sendCommand => {
+    const existing = await imapFetchMessagesByUids(sendCommand, [uid], false)
+    await sendCommand(`UID STORE ${uid} +FLAGS (\\Deleted)`)
+    await sendCommand('EXPUNGE')
+    return existing[0] || { id: `imap_${uid}`, uid, subject: '(Deleted from IMAP)' }
+  })
+}
+
+async function smtpSendDraft(smtpCfg, draft) {
+  return withRetry(async () => {
+    const socket = await createLineSocket(smtpCfg)
+    let buffer = ''
+    let waiter = null
+
+    const checkWaiter = () => {
+      if (!waiter) return
+      // Match completed SMTP response line (3 digits followed by space, not hyphen)
+      const lines = buffer.split(/\r?\n/)
+      for (let i = 0; i < lines.length - 1; i++) {
+        const line = lines[i]
+        const m = /^(\d{3}) (.*)$/.exec(line)
+        if (m) {
+          const consumed = lines.slice(0, i + 1).join('\r\n')
+          buffer = lines.slice(i + 1).join('\r\n')
+          const w = waiter
+          waiter = null
+          const code = Number(m[1])
+          if (code >= 200 && code < 400) {
+            w.resolve({ code, text: consumed })
+          } else {
+            w.reject(new Error(`SMTP ${code}: ${consumed}`))
+          }
+          return
+        }
+      }
+    }
+
+    socket.on('data', chunk => {
+      buffer += chunk.toString('utf8')
+      checkWaiter()
+    })
+
+    const readResponse = () => new Promise((resolve, reject) => {
+      waiter = { resolve, reject }
+      checkWaiter()
+    })
+
+    const sendLine = line => {
+      socket.write(`${line}\r\n`)
+      return readResponse()
+    }
+
+    try {
+      await readResponse()
+      await sendLine('EHLO aura-agent.local')
+      const authPlain = Buffer.from(`\0${smtpCfg.user}\0${smtpCfg.pass}`, 'utf8').toString('base64')
+      await sendLine(`AUTH PLAIN ${authPlain}`)
+      await sendLine(`MAIL FROM:<${smtpCfg.from}>`)
+      await sendLine(`RCPT TO:<${draft.to}>`)
+      await sendLine('DATA')
+
+      const encodedSubject = `=?UTF-8?B?${Buffer.from(draft.subject, 'utf8').toString('base64')}?=`
+      const msgId = `<aura.${Date.now()}@aura-agent.local>`
+      const headers = [
+        `From: ${smtpCfg.from}`,
+        `To: ${draft.to}`,
+        `Subject: ${encodedSubject}`,
+        `Message-ID: ${msgId}`,
+        `Date: ${new Date().toUTCString()}`,
+        'MIME-Version: 1.0',
+        'Content-Type: text/plain; charset=utf-8',
+        'Content-Transfer-Encoding: base64',
+        ...(draft.replyTo ? [`In-Reply-To: <${draft.replyTo}>`] : []),
+      ]
+      const bodyB64 = Buffer.from(draft.body, 'utf8').toString('base64').replace(/(.{76})/g, '$1\r\n')
+      const mimeData = `${headers.join('\r\n')}\r\n\r\n${bodyB64}\r\n.`
+      await sendLine(mimeData)
+      await sendLine('QUIT').catch(() => {})
+      socket.end()
+      return { messageId: msgId }
+    } catch (err) {
+      socket.destroy()
+      throw err
+    }
+  })
+}
+
 function parseArgs(argv) {
   const cmd = argv[2] || ''
   const flags = {}
@@ -98,31 +454,54 @@ function requireL3Approval(flags, actionDesc) {
   return approvedBy
 }
 
-function main() {
+async function main() {
   const { cmd, flags } = parseArgs(process.argv)
   const store = loadStore()
+  const mailCfg = loadMailConfig()
 
   if (cmd === 'unread') {
     const limit = Number(flags.limit || 20)
-    const items = store.messages.filter(m => m.unread).slice(0, limit)
-    process.stdout.write(JSON.stringify({ count: items.length, items }) + '\n')
+    const items = mailCfg.imap.enabled
+      ? await imapListUnread(mailCfg.imap, limit)
+      : store.messages.filter(m => m.unread).slice(0, limit)
+    process.stdout.write(JSON.stringify({
+      provider: mailCfg.imap.enabled ? 'imap' : 'local',
+      count: items.length,
+      items,
+    }) + '\n')
     return
   }
 
   if (cmd === 'read') {
     const id = String(flags.id || '').trim()
-    const msg = store.messages.find(m => m.id === id)
+    if (!id) fail(400, 'Usage: mail-cli read --id <msgId>')
+    const msg = mailCfg.imap.enabled && id.startsWith('imap_')
+      ? await imapReadMessage(mailCfg.imap, id)
+      : store.messages.find(m => m.id === id)
     if (!msg) fail(404, `Message not found: ${id}`)
-    process.stdout.write(JSON.stringify({ message: msg }) + '\n')
+    process.stdout.write(JSON.stringify({
+      provider: mailCfg.imap.enabled && id.startsWith('imap_') ? 'imap' : 'local',
+      message: msg,
+    }) + '\n')
     return
   }
 
   if (cmd === 'search') {
-    const q = String(flags.query || '').toLowerCase()
-    const items = store.messages.filter(
-      m => m.subject.toLowerCase().includes(q) || m.body.toLowerCase().includes(q) || m.from.toLowerCase().includes(q),
-    )
-    process.stdout.write(JSON.stringify({ query: q, count: items.length, items }) + '\n')
+    const q = String(flags.query || '').trim()
+    const items = mailCfg.imap.enabled
+      ? await imapSearchMessages(mailCfg.imap, q)
+      : store.messages.filter(
+          m =>
+            m.subject.toLowerCase().includes(q.toLowerCase()) ||
+            m.body.toLowerCase().includes(q.toLowerCase()) ||
+            m.from.toLowerCase().includes(q.toLowerCase()),
+        )
+    process.stdout.write(JSON.stringify({
+      provider: mailCfg.imap.enabled ? 'imap' : 'local',
+      query: q,
+      count: items.length,
+      items,
+    }) + '\n')
     return
   }
 
@@ -157,15 +536,38 @@ function main() {
     const idx = store.drafts.findIndex(d => d.id === draftId)
     if (idx < 0) fail(404, `Draft not found: ${draftId}`, 'L3')
     const [draft] = store.drafts.splice(idx, 1)
-    const sentMsg = { ...draft, sentId: `sent_${Date.now()}`, sentAt: new Date().toISOString(), approvedBy }
+    let smtpResult = null
+    if (mailCfg.smtp.enabled) {
+      smtpResult = await smtpSendDraft(mailCfg.smtp, draft)
+    }
+    const sentMsg = {
+      ...draft,
+      sentId: smtpResult?.messageId || `sent_${Date.now()}`,
+      sentAt: new Date().toISOString(),
+      provider: mailCfg.smtp.enabled ? 'smtp' : 'local',
+      approvedBy,
+    }
     store.sent.push(sentMsg)
     if (draft.replyTo) {
       const orig = store.messages.find(m => m.id === draft.replyTo)
       if (orig) orig.unread = false
     }
-    store.auditLog.push({ at: sentMsg.sentAt, action: 'send', draftId, to: draft.to, subject: draft.subject, approvedBy })
+    store.auditLog.push({
+      at: sentMsg.sentAt,
+      action: 'send',
+      provider: sentMsg.provider,
+      draftId,
+      to: draft.to,
+      subject: draft.subject,
+      approvedBy,
+    })
     saveStore(store)
-    process.stdout.write(JSON.stringify({ ok: true, tier: 'L3', sent: sentMsg }) + '\n')
+    process.stdout.write(JSON.stringify({
+      ok: true,
+      tier: 'L3',
+      provider: sentMsg.provider,
+      sent: sentMsg,
+    }) + '\n')
     return
   }
 
@@ -173,16 +575,23 @@ function main() {
     const id = String(flags.id || '').trim()
     if (!id) fail(400, 'Usage: mail-cli delete --id <msgId> --approved-by <confirmation>')
     const approvedBy = requireL3Approval(flags, `永久删除邮件 ${id}`)
+    if (mailCfg.imap.enabled && id.startsWith('imap_')) {
+      const removed = await imapDeleteMessage(mailCfg.imap, id)
+      store.auditLog.push({ at: new Date().toISOString(), action: 'delete', provider: 'imap', id, subject: removed.subject, approvedBy })
+      saveStore(store)
+      process.stdout.write(JSON.stringify({ ok: true, tier: 'L3', provider: 'imap', deleted: removed }) + '\n')
+      return
+    }
     const idx = store.messages.findIndex(m => m.id === id)
     if (idx < 0) fail(404, `Message not found: ${id}`, 'L3')
     const [removed] = store.messages.splice(idx, 1)
-    store.auditLog.push({ at: new Date().toISOString(), action: 'delete', id, subject: removed.subject, approvedBy })
+    store.auditLog.push({ at: new Date().toISOString(), action: 'delete', provider: 'local', id, subject: removed.subject, approvedBy })
     saveStore(store)
-    process.stdout.write(JSON.stringify({ ok: true, tier: 'L3', deleted: removed }) + '\n')
+    process.stdout.write(JSON.stringify({ ok: true, tier: 'L3', provider: 'local', deleted: removed }) + '\n')
     return
   }
 
   fail(400, `Unknown mail-cli subcommand: ${cmd}`)
 }
 
-main()
+main().catch(err => fail(500, err instanceof Error ? err.message : String(err)))

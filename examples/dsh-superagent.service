@@ -1,0 +1,45 @@
+# Systemd unit for running dsh-superagent in production (User mode or System mode).
+#
+# User mode installation (recommended, no root needed after `loginctl enable-linger $USER`):
+#   mkdir -p ~/.config/systemd/user
+#   cp examples/dsh-superagent.service ~/.config/systemd/user/dsh-superagent.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now dsh-superagent.service
+#
+# Check status & logs:
+#   systemctl --user status dsh-superagent.service
+#   journalctl --user -u dsh-superagent.service -f
+
+[Unit]
+Description=DeepSeek Harness Superagent (Project Aura)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/dsh-superagent-prototype
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="NODE_ENV=production"
+Environment="DSH_SUPERAGENT_PROFILE=superagent"
+Environment="DSH_SUPERAGENT_URL=http://127.0.0.1:3082"
+UMask=0077
+
+# Run DSH in foreground so systemd tracks the main PID directly
+ExecStart=/usr/bin/env dsh --profile superagent --no-open
+
+# Send SIGINT and allow up to 300s so active Worker Sessions finish their current step cleanly
+KillSignal=SIGINT
+TimeoutStopSec=300
+
+# Automatic crash recovery with backoff
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# Resource & security hardening
+NoNewPrivileges=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target
