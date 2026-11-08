@@ -7,6 +7,7 @@ Use this guide to install, configure and operate dsh-superagent. It covers accou
 - **A dedicated DeepSeek Harness profile**, called `superagent` in this guide. Create it from the Web profile template. It loads the bundle and serves its panel on `127.0.0.1`. Keep it separate from the profile you work in: the plugin changes process-wide `PATH` and git settings, and its process needs independent restarts and upgrades.
 - **An agent GitHub account.** The agent comments, pushes branches and opens pull requests as this account, through a GitHub CLI signed in only as that account.
 - **Optional:** a Feishu bot for chat requests.
+- **Optional:** a Telegram bot for chat requests, direct messages and scheduled cards.
 
 Plugin configuration holds the state directory and machine limits. Use the panel for everything else: Sources for the repository and accounts, Policy for allowed lists, and Execution for worker directories and commands.
 
@@ -22,6 +23,8 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
 
 - Node.js 22.19+ or 24+, pnpm, git 2.32+, Python 3.8+ and tmux
 - GitHub CLI (`gh`) 2.48 or later. Source CLI fields must point to `gh` or `lark-cli` wrappers; the host relies on their subcommands and output formats.
+- For Telegram: a bot token from [@BotFather](https://t.me/BotFather), its bot id and username, and the chat ids to watch. `tg-cli` reads them from `~/.config/tg-bot/config.json` (`{"botToken", "botId", "botUsername"}`), or from `TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_ID` and `TELEGRAM_BOT_USERNAME`. The bot must be a member of every group you configure, or receive direct messages, and it needs no admin rights.
+- The personal assistant CLIs in `scripts/aura-cli/` on `PATH`; see [Personal assistant CLIs](#personal-assistant-clis).
 - A repository on github.com; GitHub Enterprise Server is not supported. To create a checkout per Ticket, keep a local clone from which the prepare command can add worktrees. Install `git-lfs` if that repository uses Git LFS.
 - A model provider configured for DeepSeek Harness. dsh-superagent uses the profile's default model unless the Eval or Execution settings name another.
 - For Feishu: `lark-cli` (tested with 1.0.90) and a Feishu or Lark app with a bot
@@ -86,6 +89,22 @@ The fourth command creates `~/.dsh/profiles/superagent` from the DeepSeek Harnes
 
 Run the profile-creation command only for a new installation. If the profile already exists, that command replaces it and deletes its `cordis.patch.yml`, including machine configuration. Do not use it for upgrades.
 
+### Personal assistant CLIs
+
+The Telegram Source and the L3 approval flow run `scripts/aura-cli/*` by name, so those programs must be on the `PATH` of the process that starts `dsh`:
+
+```sh
+mkdir -p ~/.local/bin
+ln -sf "$PWD"/scripts/aura-cli/{tg-cli,gcal-cli,mail-cli,tavily-cli,aura-kb,aura-cron} ~/.local/bin/
+scripts/aura-cli/aura-approve keygen
+```
+
+`~/.local/bin` must be on that `PATH`; the systemd unit below sets it, and an interactive shell usually has it already. Leave `aura-approve` out of the links: it mints approval tokens, so a Worker must not be able to run it. Call it by path from your own shell.
+
+`keygen` creates `~/.config/aura-agent/approval.key` with mode 0600 and never overwrites an existing key. L3 commands accept only a token from `aura-approve issue --action <action> --target <target>`; a token expires after five minutes and works once, and consumed tokens leave a file under `<AURA_DATA_DIR>/approvals`. Set `AURA_APPROVAL_KEY_FILE` to move the key, and `AURA_DATA_DIR` (default `~/.dsh/state/superagent/aura-data`) to move the token ledger and the calendar and mail data. Keep the key out of backups you share, and delete stale ledger files before copying that directory to another machine.
+
+Each CLI reads its own credentials: `~/.config/tg-bot/config.json` for Telegram, `~/.config/aura-agent/tavily.json` (`{"apiKey": "…"}`) for search, and the approval key above. `tg-cli` creates its config with mode 0600 inside a directory with mode 0700; create the Tavily file the same way.
+
 ## Machine configuration
 
 Copy [examples/profile.cordis.patch.yml](../examples/profile.cordis.patch.yml) to `~/.dsh/profiles/superagent/cordis.patch.yml`, replacing that file, and replace every `<placeholder>`. For Feishu, also enable the `dsh-superagent-feishu` entry there. The `webserver` entry sets the panel's port.
@@ -140,12 +159,14 @@ Check dsh-superagent: run `scripts/dsh-superagent --profile superagent status` i
 
 `--respect-stop` preserves an intentional stop. Only `stop` writes the marker; `start` clears it. `restart` writes no marker, so the check can recover a restart whose shutdown timed out.
 
+To run the check from cron instead, `aura-cron print-crontab --chat-id <id>` prints entries for the morning briefing, the weekly digest and this hourly check. It writes a `PATH` that reaches `node`, `dsh` and `tmux`, and the check restarts only when `status` exits 1.
+
 ## Settings
 
 Setup must succeed before polling or work starts. Overview lists missing requirements and links to their settings. A settings change runs setup again. If you fix something outside the application, such as CLI authentication, choose **Check again**.
 
-1. **Sources.** Set the GitHub repository (`owner/name`) and agent CLI, for example `/home/me/.local/bin/gh-agent`. Requests normally arrive through the agent account's notifications. A new Issue or comment mentioning the account arrives on the next poll; adding a mention by editing an existing Issue body does not. Post a new comment instead. For Feishu, set the bot CLI, chats, each chat's receive-all or mentions-only mode, and whether to receive direct messages.
-2. **Policy.** The two example rules can be edited or removed. Under **On each Source**, add the GitHub accounts and Feishu users who may ask for work; until a list has someone, no request can become a Ticket. With Feishu, a chat can be chosen to sync the list from, at startup and on **Sync now**.
+1. **Sources.** Set the GitHub repository (`owner/name`) and agent CLI, for example `/home/me/.local/bin/gh-agent`. Requests normally arrive through the agent account's notifications. A new Issue or comment mentioning the account arrives on the next poll; adding a mention by editing an existing Issue body does not. Post a new comment instead. For Feishu, set the bot CLI, chats, each chat's receive-all or mentions-only mode, and whether to receive direct messages. For Telegram, set the chats and chat ids to watch, each chat's receive-all or mentions-only mode, whether to receive direct messages, and the poll interval (2 to 3600 seconds, default 10). The bot token, id and username stay in `~/.config/tg-bot/config.json`, so the panel stores only the chat list, and messages the bot sends itself are ignored. A scheduled card from `cron-bot` is admitted only when `cron-bot` is listed under **Bots** for that Source in Policy.
+2. **Policy.** The two example rules can be edited or removed. Under **On each Source**, add the GitHub accounts, Feishu users and Telegram users who may ask for work; until a list has someone, no request can become a Ticket. With Feishu, a chat can be chosen to sync the list from, at startup and on **Sync now**.
 3. **Execution.** The directory root and a prepare command. To give each Ticket a checkout of the repository:
 
    ```sh
@@ -188,6 +209,7 @@ Health entries are grouped by responsibility:
 | `assessment`, `launch`, `delivery`, `relay`, `notice`, `reply` | Stored work described in [003 Execution](003-execution.md); delivery counts waiting work, while reply covers Channel messages |
 | `worker` | Executor Session event handling; appears after its first failure |
 | `github`, `feishu`, `history` | Source polling, events and history recovery |
+| `telegram` | Telegram polling: `paused` until the bot CLI and config are usable, `error` after three consecutive poll failures |
 | `sync:<source id>` | Allowed-list synchronization |
 
 A refusal has a status and `error`, its English text:

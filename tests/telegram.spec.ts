@@ -1,10 +1,10 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { execFile, execFileSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import net from 'node:net'
-import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { homedir, tmpdir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -634,6 +634,20 @@ describe('Telegram Source', () => {
       sender: { id: 'cron-bot', name: 'Daily Scheduler', bot: true },
     })
     expect(injected.injected.text).toContain('[CRON:morning-briefing]')
+
+    // The printed crontab must restart only when `status` exits 1, so `||` here would fire on every run.
+    const crontab = String(run(cronPath, ['print-crontab', '--chat-id', ALLOWED_USER, '--repo-dir', '/srv/dsh-superagent']).crontab)
+    const lines = crontab.split('\n')
+    const check = lines.find(line => line.includes('--profile superagent status'))!
+    expect(check).toMatch(/^0 \* \* \* \* /)
+    expect(check).toContain('status >/dev/null 2>&1; [ $? -eq 1 ] && ')
+    expect(check).not.toContain('|| [ $?')
+    expect(check).toContain('--respect-stop restart')
+    const path = lines.find(line => line.startsWith('PATH='))!.slice('PATH='.length).split(':')
+    expect(path).toContain(join(homedir(), '.local', 'bin'))
+    expect(path).toContain(dirname(process.execPath))
+    // Every entry must exist: a fixed platform path such as /opt/homebrew/bin would not on Linux.
+    for (const dir of path) expect(existsSync(dir)).toBe(true)
 
     const pulled = run(tgPath, ['pull', '--after', '0', '--json'])
     expect(pulled.items).toHaveLength(1)
