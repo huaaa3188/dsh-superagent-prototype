@@ -8,9 +8,9 @@ import { health, sourceContext, type SourceContext } from './host.ts'
 import type { SourceKind } from './kind.ts'
 import { sendTelegram, telegramLink } from './telegram-channel.ts'
 import { telegramThreadContext } from './telegram-read.ts'
-import { SOURCE, TelegramItemSchema, telegramTrigger, telegramTriggerId } from './telegram-trigger.ts'
+import { SOURCE, TelegramItemSchema, telegramFind, telegramTrigger, telegramTriggerId } from './telegram-trigger.ts'
 
-export { SOURCE, TelegramItemSchema, telegramChannel, telegramThreadId, telegramTime, telegramTrigger, telegramTriggerId }
+export { SOURCE, TelegramItemSchema, telegramChannel, telegramFind, telegramThreadId, telegramTime, telegramTrigger, telegramTriggerId }
   from './telegram-trigger.ts'
 export type { TelegramItem } from './telegram-trigger.ts'
 export { sendTelegram, telegramLink } from './telegram-channel.ts'
@@ -78,7 +78,7 @@ export const telegramKind: SourceKind<TelegramConfig> = {
     link: telegramLink,
   },
   threadContext: telegramThreadContext,
-  find: query => ({ threads: [], terms: [...new Set(query.match(/\btgmsg_[0-9]+\b/g) ?? [])] }),
+  find: query => telegramFind(query),
   repliesTo: trigger =>
     typeof trigger.meta.chatId === 'string' && typeof trigger.meta.parentId === 'string'
       ? telegramTriggerId(trigger.meta.chatId, trigger.meta.parentId)

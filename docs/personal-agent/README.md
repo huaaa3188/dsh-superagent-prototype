@@ -8,11 +8,12 @@
 
 1. **[产品需求文档 (PRD.md)](./PRD.md)**  
    * 定义了系统的产品愿景、核心痛点、注意力经济三大支柱与对齐 `dsh-superagent` 领域模型的系统架构图；
-   * 规范了 Telegram `SourceKind` 准入与订阅扇出（Subscription Fan-out）契约、基于主动规则（Proactive Rule + Bot Trigger）的 08:00 晨间简报流水线、映射到 `Prompts`/`Store`/`knowledge` 的三层共生记忆架构，以及基于 `Attention (human_action)` 与命令 Shim 的 L1/L2/L3 权限分级契约。
+   * 规范了 Telegram `SourceKind` 准入与订阅扇出（Subscription Fan-out）契约、基于主动规则（Proactive Rule + Bot Trigger）的 08:00 晨间简报流水线、映射到 `Prompts`/`Store`/`knowledge` 的三层共生记忆架构，以及基于 `Attention (human_action)` 与 `aura-approve` 一次性令牌的 L1/L2/L3 权限分级契约。
 
 2. **[完整技术实现方案 (TECHNICAL_ARCHITECTURE.md)](./TECHNICAL_ARCHITECTURE.md)**  
    * 详细阐述了如何零侵入复用 `Engine`、`Main Session (orchestrator)`、`DshExecutor` 与 `Outbox`；
-   * 严格遵循 [`008-cookbook.md`](../008-cookbook.md) 设计了 `src/sources/telegram*.ts`、`KV.telegram`、`tg-cli` 受控传输协议、内联审批按钮回调闭环、VPS `dsh --profile superagent` 部署方案以及 `tests/telegram.spec.ts` 验证标准。
+   * 严格遵循 [`008-cookbook.md`](../008-cookbook.md) 设计了 `src/sources/telegram*.ts`、`KV.telegram`、`tg-cli` 受控传输协议、内联按钮回调到 `tg-cli` 事件归一化的链路、VPS `dsh --profile superagent` 部署方案以及 `tests/telegram.spec.ts` 验证标准；
+   * 文中凡标注**未验证**或**草案**的章节（如 Docker 容器化、宿主自动签发令牌）均尚未在本仓库实现，请以 PRD 的 Roadmap 状态为准。
 
 3. **[交互原型系统 (prototype.html)](./prototype.html)**  
    * 高保真、可交互的单文件 Web 原型；

@@ -52,8 +52,8 @@ flowchart TD
         W_Inbox["Ticket Worker: 邮件与日程管家<br>· work/inbox-*"]
     end
 
-    subgraph Integrations["外部能力与记忆资产 (CLI Shims + Skills + Knowledge)"]
-        CLIs["受控 CLI 工具集 (worker-bin)<br>· gcal-cli · mail-cli · tavily-cli"]
+    subgraph Integrations["外部能力与记忆资产 (PATH CLI + Skills + Knowledge)"]
+        CLIs["受控 CLI 工具集 (安装到 PATH，不进 worker-bin)<br>· gcal-cli · mail-cli · tavily-cli"]
         Memory["三层共生记忆<br>· L1: Prompts/Skills · L2: Store Tickets/KV · L3: knowledge/"]
     end
 
@@ -134,7 +134,7 @@ sequenceDiagram
   * 系统预留 **1 个专属优先槽位** 给人类消息唤醒（[`003-execution.md`](../003-execution.md#L58-L60)），确保即便后台满负荷跑长任务，宿主发话也能立即得到响应。
 * **典型场景支持**：
   1. **深度网络调研（Research Ticket）**：利用内置 `@deepseek-ai/dsh-tool-web`、`tavily-cli` 与 `standard` 子智能体并行检索多源资料，交叉验证后将长文研报写入 `<stateDir>/knowledge/reports/`，并在 Telegram 返回精炼结论与归档路径。
-  2. **数字文件与邮件管家（Inbox Ticket）**：通过 `mail-cli` 扫描未读邮件，提取账单/附件归档，生成拟回复草稿并通过 `human_action` 提交宿主一键审批。
+  2. **数字文件与邮件管家（Inbox Ticket）**：通过 `mail-cli` 扫描未读邮件、生成拟回复草稿并通过 `human_action` 提交宿主审批。**注意**：当前 `mail-cli` 只解析 `text/plain` 与 `text/html` 正文，`multipart` 附件提取尚未实现（见 §5 Roadmap Phase 3 待补项）。
 
 ---
 
@@ -152,7 +152,7 @@ sequenceDiagram
 
 ### 3.5 权限分级与审批契约 (Attention & Permission Protocol)
 
-结合 [`002-authorization.md`](../002-authorization.md)、[`003-execution.md`](../003-execution.md) 与 [`004-prompts.md`](../004-prompts.md)，将权限控制落实到**执行阶段汇报**与**底层命令 Shim 硬隔离**：
+结合 [`002-authorization.md`](../002-authorization.md)、[`003-execution.md`](../003-execution.md) 与 [`004-prompts.md`](../004-prompts.md)，将权限控制落实到**执行阶段汇报**与**一次性审批令牌（可执行硬校验）**：
 
 ```
 +-----------------------------------------------------------------------+
@@ -171,11 +171,16 @@ sequenceDiagram
 | L3 级：对外发送/不可逆写操作 (执行期强拦截，必须人类 Attention 审批)    |
 | 范围：正式对外发送邮件、删除重要日程/文件、触发外部写接口              |
 | 机制：                                                                |
-|   1. 软硬双控：worker-bin 下的 CLI Shim 拒绝无审批凭据的高危子命令；   |
+|   1. 一次性令牌：`aura-approve` 用本机 HMAC 密钥签发绑定 action+target |
+|      的令牌（默认 5 分钟有效），CLI 校验签名并原子消费 nonce，故令牌   |
+|      无法被伪造、挪用或重放；                                         |
 |   2. 结构化提问：Worker 调用 orchestrator_report(human_action: ...)； |
 |   3. 内联卡片：Main Session 调用 orchestrator_reply(purpose: attention)|
 |      在 Telegram 弹出带 [ ✓ 确认执行 ] / [ ✕ 放弃 ] 的审批卡片；       |
 |   4. 唤醒放行：宿主点击按钮后作为同 Thread Trigger 唤醒 Worker 完成操作|
+|                                                                       |
+| 残余风险：Worker 与宿主同为单 OS 用户，主动读取密钥文件仍可自行签发；  |
+| 真正隔离需将 Worker 置于独立 OS 账号（见 006-deployment.md 权限章节）。|
 +-----------------------------------------------------------------------+
 ```
 
@@ -188,7 +193,7 @@ sequenceDiagram
 * **核心运行底座**：
   * Node.js `^22.19.0 || >=24.0.0`、`pnpm`、`git` 2.32+、`python3` 3.8+、`tmux`。
   * **DeepSeek Harness (`@deepseek-ai/dsh`)**：以独立 Profile（`superagent`）运行本插件 Bundle。
-  * **受控 CLI 封装（`~/.local/bin/`）**：`tg-bot`（Telegram 机器人 CLI）、`gcal-agent`（日历 CLI）、`mail-agent`（邮件 CLI）。
+  * **受控 CLI 封装（`~/.local/bin/`）**：`tg-cli`（Telegram 机器人 CLI）、`gcal-cli`（日历 CLI）、`mail-cli`（邮件 CLI）。
 * **进程管理与自愈**：
   * 使用仓库自带的 `scripts/dsh-superagent start|stop|restart|status` 脚本在 `tmux` 会话中托管服务；
   * 配置每小时自愈巡检（Hourly Check，根据 `status` 退出码 `0/1/2/3` 自动恢复异常或上报配置错误）。
@@ -204,16 +209,22 @@ sequenceDiagram
 
 ## 5. 项目分阶段实施路线图 (Roadmap)
 
+> 状态口径：**已完成**＝有实现且有 `tests/` 覆盖；**部分完成**＝主路径可用但存在明确缺口（缺项写在条目内）；**未开始**＝仅有设计。
+
 ### Phase 1: Telegram `SourceKind` 接入与核心闭环（已完成）
 - [x] 编写 `tg-cli` CLI 脚本与 `src/sources/telegram*.ts` 插件（遵循 [`008-cookbook.md`](../008-cookbook.md) 规范，支持可选解耦 GitHub 仓库）。
 - [x] 完成 `KV.telegram` 游标注册、`tsdown.config.ts` / `package.json` / `cordis.patch.yml` 导出配置，并通过 `tests/telegram.spec.ts` 与 `tests/docs.spec.ts` 全量测试。
-- [x] 部署 `superagent` Profile，打通 Telegram 白名单准入、单句 `acknowledgement` 回执、Worker 执行与 `result` 交付闭环。
+- [x] 打通 Telegram 白名单准入、单句 `acknowledgement` 回执、Worker 执行与 `result` 交付闭环（`superagent` Profile 的最终线上部署由宿主执行，仓库内不含线上环境凭据）。
 
-### Phase 2: 个人工具链（CLI + Skills）与 L3 审批闭环（已完成）
-- [x] 封装 `gcal-cli`、`mail-cli` 与 `tavily-cli`（位于 `scripts/aura-cli/`），实现 L1/L2/L3 权限分级与 `--approved-by` 硬校验。
+### Phase 2: 个人工具链（CLI + Skills）与 L3 审批闭环（部分完成）
+- [x] 封装 `gcal-cli`、`mail-cli` 与 `tavily-cli`（位于 `scripts/aura-cli/`），实现 L1/L2/L3 权限分级与 `--approved-by` 一次性令牌校验（`aura-approve` 签发，HMAC + nonce 原子消费）。
 - [x] 编写 `skills/dsh-superagent-telegram/SKILL.md` 及个人工具 Skill，配置 Team Prompt Sections 注入宿主画像（L1 Memory）。
-- [x] 验证 `human_action` → `purpose: 'attention'` → Telegram Inline Keyboard 点击回调 → 唤醒 Worker 放行 L3 操作的完整链路。
+- [ ] **待补**：`human_action` → `purpose: 'attention'` → Telegram Inline Keyboard 点击回调 → 自动签发令牌的全链路自动化。宿主侧当前没有任何 HTTP 路由处理 `callback_query`，点击按钮只会产生一条同 Thread 的 Trigger，令牌仍需宿主手工运行 `aura-approve issue` 签发（`scripts/aura-cli/aura-approve`）。
 
-### Phase 3: 主动晨报（Proactive Rule）与长期知识库演进（已完成）
+### Phase 3: 主动晨报（Proactive Rule）与长期知识库演进（部分完成）
 - [x] 编写 `aura-cron` 定时触发器并配置 `morning-briefing` / `memory-digest` 主动规则，打通每日晨报卡片与快捷内联按钮推送。
 - [x] 编写 `aura-kb` 知识库 CLI，配置 `<stateDir>/knowledge/` 本地知识库与 `prepare` 脚本，跑通深度调研长文沉淀、索引更新与历史检索（L3 Memory）。
+- [ ] **待补**：§3.3 场景中的"账单附件提取"未实现——`mail-cli` 仅解析 `text/plain` / `text/html` 正文，不解析 multipart 附件。
+
+### Phase 4: 容器化部署（未开始）
+- [ ] 仓库根目录 `Dockerfile` 与 [`examples/docker-compose.yml`](../../examples/docker-compose.yml) 目前是未验证草案：Web 服务按设计拒绝绑定通配地址，需改用 `network_mode: host`；镜像亦需补装 `@deepseek-ai/dsh` 与 GitHub CLI。生产路径请先用 `systemd`（见 [`TECHNICAL_ARCHITECTURE.md`](TECHNICAL_ARCHITECTURE.md) §4.4 方案 A）。

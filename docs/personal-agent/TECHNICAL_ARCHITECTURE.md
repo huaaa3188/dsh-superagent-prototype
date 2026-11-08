@@ -24,7 +24,7 @@
 | **L3 高危操作审批卡片** | **`Attention` (`human_action`)** + [`Outbox`](../../src/app/outbox.ts) (`purpose: 'attention'`) | Worker 遇到外发邮件/删除日程等 L3 动作时，调用 `orchestrator_report(state: 'progress', human_action: ...)`；主 Session 调用 `orchestrator_reply(purpose: 'attention')`；`sendTelegram` 解析动作指令并渲染 Inline Keyboard 审批按钮 | 🟢 在 `telegram-channel.ts` 中支持按钮渲染 |
 | **08:00 晨间主动简报** | **Proactive Rule (`Policy.rules`)** + **Bot Trigger (`via: 'bot'`)** | 系统定时器（Cron）通过 `tg-cli` 注入一条 `actor: { id: 'cron-bot' }` 的触发事件 → Gate 识别为 `inferred` 候选 → 主 Session 按启用的 `morning-briefing` 规则评估并创建晨报 `Ticket`（支持先 `observe` 后 `auto`） | 🟢 1 条定时命令 + 1 条 Policy 规则 |
 | **三层共生记忆 (Living Memory)** | **L1: [`Prompts`](../../src/app/prompts.ts) (Team Sections / Skills)**<br>**L2: [`Store`](../../src/app/store.ts) (`orchestrator.sqlite`)**<br>**L3: `<stateDir>/knowledge/`** | L1 个人画像存入带版本控制的 Team Sections 与自定义 Skill；L2 活跃状态直接复用 SQLite 中的 Open/Idle `Tickets` 与 `KV`；L3 历史研报与笔记通过 `prepare` 脚本挂载到每个 Worker 目录 | 🟢 配置 Prompt 与 `prepare` 脚本 |
-| **日历/邮件/检索外部工具** | **[`Commands`](../../src/infra/commands.ts) + `<stateDir>/worker-bin` Shims + `skills/`** | 参照 `gh` 与 `lark-cli` 模式，提供 `tg-cli`、`gcal-cli`、`mail-cli` 命令行工具及配套 `SKILL.md`；Worker 通过 Bash 调用，超 5 秒自动转后台 Job，内置 `@deepseek-ai/dsh-tool-web` 支持联网搜索 | 🟡 编写轻量 CLI 脚本与 Skill 文档 |
+| **日历/邮件/检索外部工具** | **[`Commands`](../../src/infra/commands.ts) + `PATH` 上的可执行文件 + `skills/`** | 提供 `tg-cli`、`gcal-cli`、`mail-cli` 命令行工具及配套 `SKILL.md`；这些文件直接安装在 `PATH`（如 `~/.local/bin` 或镜像里的 `/usr/local/bin`），**不经过 `<stateDir>/worker-bin` shim**（该目录只放 `gh`/`lark-cli` 与 `blockedCommands` 的阻断壳）；Worker 通过 Bash 调用，超 5 秒自动转后台 Job，内置 `@deepseek-ai/dsh-tool-web` 支持联网搜索 | 🟡 编写轻量 CLI 脚本与 Skill 文档 |
 
 ---
 
@@ -105,7 +105,7 @@ export const KV = {
 ### 3.3 外部传输层：`tg-cli` 契约设计
 
 为什么不直接在プラグイン进程里引第三方 `grammY` 包裸跑，而是像 Feishu (`lark-cli`) 和 GitHub (`gh`) 一样走 [`Commands.run`](../../src/infra/commands.ts)？
-1. **凭证隔离**：[`006-deployment.md`](../006-deployment.md#L218) 明确规定，系统会清理含 `TOKEN`/`KEY`/`SECRET` 的环境变量；将 Bot Token 封装在 `~/.config/tg-bot/config.json` 与 `~/.local/bin/tg-bot` 包装脚本中，Worker 无法直接窃取裸 Token。
+1. **凭证隔离**：[`006-deployment.md`](../006-deployment.md#L218) 明确规定，系统会清理含 `TOKEN`/`KEY`/`SECRET` 的环境变量；将 Bot Token 封装在 `~/.config/tg-bot/config.json` 与 `~/.local/bin/tg-cli` 包装脚本中，Worker 无法直接窃取裸 Token。
 2. **高度可测试性**：完全遵循 [`tests/sources.spec.ts`](../../tests/sources.spec.ts) 模式，只需 `vi.spyOn(commands, 'run')` 即可在毫秒级完成全部边界测试（网络超时、403 用户屏蔽、`gone` 永久失败、游标中断恢复）。
 
 `tg-cli` 支持以下 3 个标准子命令（输出严格 JSON）：
@@ -133,7 +133,7 @@ export const KV = {
    #   "next": 10043
    # }
    ```
-   > **注**：当用户在 Telegram 点击内联审批按钮（如 `[ ✓ 确认发送 ]`）时，`tg-cli pull` 将 `callback_query` 归一化为一条 `root_id` 指向原卡片根消息、`reply_to_id` 指向卡片消息、`text` 为回调指令（如 `[ACTION:approve_send]`）的事件，并自动调用 `answerCallbackQuery` 消除按钮加载态。
+   > **注**：当用户在 Telegram 点击内联按钮（如 `[ ✓ 确认发送 ]`）时，`tg-cli pull` 将 `callback_query` 归一化为一条 `root_id` 指向原卡片根消息、`reply_to_id` 指向卡片消息、`text` 为按钮 `data`（如 `approve:evt_3`）的事件，并自动调用 `answerCallbackQuery` 消除按钮加载态。**该事件只会唤醒原 Thread 的 Worker，不会自动签发 L3 令牌**：宿主仍需运行 `aura-approve issue --action <action> --target <target>` 并把令牌交回 Worker（见 §3.5 与 PRD Roadmap Phase 2 待补项）。
 
 2. **幂等发送与按钮渲染**：
    ```sh
@@ -156,13 +156,12 @@ export const KV = {
 ```ts
 /** Normalizes Telegram Bot updates (messages, replies, and inline button callbacks) into domain Triggers. */
 import { z } from 'zod'
-import { key, type ChannelRef, type Trigger } from '../core/index.ts'
+import { key, threadKey, type ChannelRef, type Trigger } from '../core/index.ts'
 
 export const SOURCE = 'telegram'
 
 export const TelegramItemSchema = z.looseObject({
-  update_id: z.number().int(),
-  event_id: z.string().min(1).optional(),
+  id: z.string().min(1),
   message_id: z.string().min(1),
   chat_id: z.string().min(1),
   chat_type: z.enum(['private', 'group', 'supergroup', 'channel']),
@@ -177,25 +176,50 @@ export const TelegramItemSchema = z.looseObject({
   mentions_me: z.boolean().default(false),
   text: z.string(),
   at: z.string(),
+  url: z.string().optional(),
 })
 export type TelegramItem = z.infer<typeof TelegramItemSchema>
 
-export const telegramTriggerId = (chatId: string, eventOrMsgId: string): string =>
-  key(SOURCE, `${chatId}:${eventOrMsgId}`)
+export const telegramTriggerId = (chatId: string, eventId: string): string =>
+  key(SOURCE, `${chatId}:${eventId}`)
 
 export const telegramThreadId = (chatId: string, rootId: string | undefined, messageId: string): string =>
   `${chatId}:${rootId ?? messageId}`
 
-export const telegramChannel = (chatId: string, messageId: string, direct: boolean, threadId?: string): ChannelRef => ({
+export const telegramChannel = (chatId: string, messageId: string, direct = false, threadId?: string, url?: string): ChannelRef => ({
   source: SOURCE,
   thread: `${SOURCE}:${chatId}`,
   address: {
     chatId,
     messageId,
-    direct: direct ? 'true' : 'false',
+    ...(direct ? { direct: 'true' } : {}),
     ...(threadId ? { threadId } : {}),
+    ...(url ? { url } : {}),
   },
 })
+
+/** Resolves a message reference into Thread keys and search terms, mirroring how `github.ts` resolves `#12`. */
+export function telegramFind(query: string): { threads: string[]; terms: string[] } {
+  const threads = new Set<string>()
+  const terms = new Set<string>()
+  const found = (chatId: string | undefined, messageId: string): void => {
+    terms.add(messageId)
+    if (chatId) threads.add(threadKey({ source: SOURCE, id: telegramThreadId(chatId, undefined, messageId) }))
+  }
+  // `https://t.me/c/<internal>/<message>`: the internal id behind the `-100` prefix of a supergroup chat id.
+  for (const match of query.matchAll(/https?:\/\/t\.me\/c\/(\d+)\/(\d+)/g)) {
+    if (match[1] && match[2]) found(`-100${match[1]}`, match[2])
+  }
+  // `https://t.me/<username>/<message>`: a public channel message carries a username, not a chat id.
+  for (const match of query.matchAll(/https?:\/\/t\.me\/[A-Za-z][A-Za-z0-9_]{3,}\/(\d+)/g)) {
+    if (match[1]) found(undefined, match[1])
+  }
+  // `tg://openmessage?user_id=<chat>&message_id=<message>`: what this Source writes for private chats.
+  for (const match of query.matchAll(/tg:\/\/openmessage\?[^\s]*?user_id=(-?\d+)[^\s]*?message_id=(\d+)/g)) {
+    if (match[1] && match[2]) found(match[1], match[2])
+  }
+  return { threads: [...threads], terms: [...terms] }
+}
 
 /** Converts one validated Telegram item into a Trigger; drops messages sent by the bot itself. */
 export function telegramTrigger(item: TelegramItem, botId: string): Trigger | undefined {
@@ -203,20 +227,21 @@ export function telegramTrigger(item: TelegramItem, botId: string): Trigger | un
   const direct = item.chat_type === 'private'
   const root = item.root_id ?? item.thread_id ?? item.message_id
   const thread = telegramThreadId(item.chat_id, root, item.message_id)
-  const eventKey = item.event_id ?? item.message_id
   return {
-    id: telegramTriggerId(item.chat_id, eventKey),
+    id: telegramTriggerId(item.chat_id, item.id),
     source: SOURCE,
     threads: [{ source: SOURCE, id: thread }],
     actor: { source: SOURCE, id: item.sender.id },
     human: !item.sender.bot,
     ...(direct ? { addressed: 'direct' as const } : item.mentions_me ? { addressed: 'mention' as const } : {}),
-    at: new Date(Date.parse(item.at)).toISOString(),
+    at: telegramTime(item.at),
     text: item.text,
-    channel: telegramChannel(item.chat_id, item.message_id, direct, item.thread_id),
+    channel: telegramChannel(item.chat_id, item.message_id, direct, item.thread_id, item.url),
+    ...(item.url ? { url: item.url } : {}),
     meta: {
       chatId: item.chat_id,
       messageId: item.message_id,
+      eventId: item.id,
       rootId: root,
       direct,
       mentioned: item.mentions_me,
@@ -233,25 +258,39 @@ export function telegramTrigger(item: TelegramItem, botId: string): Trigger | un
 ### 3.5 出站通道与内联按钮渲染 (`src/sources/telegram-channel.ts`)
 
 ```ts
-/** Telegram outbound channel: sends idempotent replies and inline approval keyboards through tg-cli. */
-import type { OutboundMessage } from '../core/index.ts'
+/** Telegram outbound channel: sends idempotent threaded replies and inline approval keyboards through tg-cli. */
+import { latestAssignment, type OutboundMessage } from '../core/index.ts'
 import { CliError } from '../infra/commands.ts'
 import { checkedImText } from '../infra/text.ts'
 import type { SourceContext } from './host.ts'
 import type { ChannelLink } from './kind.ts'
 import { telegramTriggerId } from './telegram-trigger.ts'
 
+const BUTTONS_RE = /<!--\s*buttons:\s*\[[\s\S]*?\]\s*-->/
+
 const gone = (error: unknown): boolean =>
-  error instanceof CliError && (error.code === 410 || error.code === 403 || /chat not found|blocked by the user|deactivated/i.test(error.message))
+  error instanceof CliError && error.code !== undefined && (
+    error.code === 410
+    || error.code === 403
+    || (error.code === 400 && /chat not found|user is deactivated|message thread not found/i.test(error.message))
+  )
 
 export async function sendTelegram(
-  host: Pick<SourceContext, 'commands'>,
+  host: Pick<SourceContext, 'commands'> & Partial<Pick<SourceContext, 'tickets'>>,
   message: OutboundMessage,
-  cli = 'tg-cli',
 ): Promise<'sent' | 'gone'> {
   const { chatId, messageId, threadId } = message.channel.address
   if (!chatId || !messageId) throw new Error('Missing Telegram reply target')
-  const text = checkedImText(message.text)
+  // Count only what a human reads: the machine-readable buttons comment is not part of the reply's length.
+  const visibleText = message.text.replace(/<!--\s*buttons:\s*\[[\s\S]*?\]\s*-->/g, '').trim() || message.text
+  checkedImText(visibleText)
+  let text = message.text
+  if (message.kind === 'reply' && !BUTTONS_RE.test(text) && message.ticketId && host.tickets) {
+    const ticket = host.tickets.get(message.ticketId)
+    const fallbackSource = ticket?.attention?.question ?? (ticket ? latestAssignment(ticket)?.report?.summary : undefined) ?? ''
+    const match = fallbackSource.match(BUTTONS_RE)
+    if (match) text = `${text}\n${match[0]}`
+  }
   const args = [
     'reply',
     '--chat-id', chatId,
@@ -263,7 +302,7 @@ export async function sendTelegram(
     ...(message.ticketId ? ['--ticket-id', message.ticketId] : []),
   ]
   try {
-    await host.commands.run(cli, args)
+    await host.commands.run('tg-cli', args)
     return 'sent'
   } catch (error) {
     if (gone(error)) return 'gone'
@@ -271,10 +310,18 @@ export async function sendTelegram(
   }
 }
 
+/** `tg-cli` does not report a link for every update, so the panel link is synthesized from the address itself. */
+const telegramUrl = (address: Record<string, string>): string => {
+  if (address.url) return address.url
+  const { chatId, messageId } = address
+  if (!chatId || !messageId) return ''
+  const topic = address.threadId ? `?thread=${address.threadId}` : ''
+  if (chatId.startsWith('-')) return `https://t.me/c/${chatId.slice(1)}/${messageId}${topic}`
+  return `tg://openmessage?user_id=${chatId}&message_id=${messageId}`
+}
+
 export const telegramLink = (address: Record<string, string>): ChannelLink => ({
-  url: address.chatId && address.messageId && !address.chatId.startsWith('-')
-    ? `tg://openmessage?user_id=${encodeURIComponent(address.chatId)}&message_id=${encodeURIComponent(address.messageId)}`
-    : '',
+  url: telegramUrl(address),
   label: { zh: 'Telegram 消息', en: 'Telegram message' },
   ...(address.chatId && address.messageId ? { triggerId: telegramTriggerId(address.chatId, address.messageId) } : {}),
 })
@@ -297,23 +344,24 @@ import { health, sourceContext, type SourceContext } from './host.ts'
 import type { SourceKind } from './kind.ts'
 import { sendTelegram, telegramLink } from './telegram-channel.ts'
 import { telegramThreadContext } from './telegram-read.ts'
-import { SOURCE, TelegramItemSchema, telegramTrigger, telegramTriggerId } from './telegram-trigger.ts'
+import { SOURCE, TelegramItemSchema, telegramFind, telegramTrigger, telegramTriggerId } from './telegram-trigger.ts'
 
 const PullPageSchema = z.looseObject({
-  me: z.looseObject({ id: z.string(), username: z.string().optional() }),
+  me: z.string().min(1),
   items: z.array(z.unknown()).default([]),
   next: z.number().int(),
 })
 
 export const TelegramConfigSchema = z.object({
-  cli: z.string().trim().min(1).default('tg-bot'),
-  directMessages: z.boolean().default(true),
   chats: z.array(z.object({
     chatId: z.string().regex(/^-?[0-9]+$/),
     name: z.string().trim().max(60).optional(),
     listen: z.enum(['mentions', 'all']),
-  }).strict()).default([]),
-  pollSeconds: z.number().int().min(2).max(300).default(5),
+  }).strict())
+    .refine(chats => new Set(chats.map(chat => chat.chatId)).size === chats.length, 'Duplicate chat IDs')
+    .default([]),
+  directMessages: z.boolean().default(true),
+  pollSeconds: z.number().int().min(2).max(3600).default(10),
 }).strict()
 export type TelegramConfig = z.infer<typeof TelegramConfigSchema>
 
@@ -321,14 +369,11 @@ export const telegramKind: SourceKind<TelegramConfig> = {
   kind: SOURCE,
   title: { zh: 'Telegram', en: 'Telegram' },
   description: {
-    zh: '通过受控机器人 CLI 接收 Telegram 私聊、指定群组及内联按钮回调。',
-    en: 'Receives Telegram direct messages, configured chats, and inline button callbacks through the bot CLI.',
+    zh: '接收 Telegram 私聊、指定群组的消息与内联按钮回调。',
+    en: 'Receives messages and inline button callbacks from Telegram direct messages and configured chats.',
   },
   schema: TelegramConfigSchema,
   fields: [
-    { key: 'cli', type: 'text', label: { zh: '机器人的 tg-cli', en: 'Bot tg-cli' },
-      hint: { zh: '命令名或绝对路径，如 ~/.local/bin/tg-bot。', en: 'Command name or absolute path, such as ~/.local/bin/tg-bot.' } },
-    { key: 'directMessages', type: 'switch', label: { zh: '接收私聊', en: 'Direct messages' } },
     { key: 'chats', type: 'rows', label: { zh: '接收的群组', en: 'Chats' },
       columns: [
         { key: 'chatId', type: 'text', label: { zh: '群 ID', en: 'Chat ID' }, pattern: '-?[0-9]+' },
@@ -337,7 +382,8 @@ export const telegramKind: SourceKind<TelegramConfig> = {
           { value: 'all', label: { zh: '全部消息', en: 'All' } },
         ] },
       ] },
-    { key: 'pollSeconds', type: 'number', advanced: true, min: 2, max: 300,
+    { key: 'directMessages', type: 'switch', label: { zh: '接收私聊', en: 'Direct messages' } },
+    { key: 'pollSeconds', type: 'number', advanced: true, min: 2, max: 3600,
       label: { zh: '轮询间隔 / 秒', en: 'Polling interval / seconds' } },
   ],
   health: ['telegram'],
@@ -358,6 +404,7 @@ export const telegramKind: SourceKind<TelegramConfig> = {
     link: telegramLink,
   },
   threadContext: telegramThreadContext,
+  find: query => telegramFind(query),
   repliesTo: trigger =>
     typeof trigger.meta.chatId === 'string' && typeof trigger.meta.parentId === 'string'
       ? telegramTriggerId(trigger.meta.chatId, trigger.meta.parentId)
@@ -498,7 +545,7 @@ async function watchTelegram(ctx: SourceContext, signal: AbortSignal): Promise<v
    * **Instruction**: `当收到 cron-bot 发送的 [CRON:morning-briefing] 触发器时，接受任务（静默接受，不发冗余确认回执）。Worker 调用 gcal-cli 与 mail-cli 拉取今日日程、未完结工单与高优未读邮件，检测时间冲突，挑选 Top 3 杠杆待办，排版为晨报卡片并在底部附上 [✓ 确认行程] [📝 补充待办] [🔕 今日免打扰] 按钮。`
 3. 在系统 Crontab 中配置每日 07:55 注入触发事件：
    ```cron
-   55 7 * * * $HOME/.local/bin/tg-bot inject --chat-id 123456789 --sender-id cron-bot --bot --text "[CRON:morning-briefing] 生成今日晨间简报"
+   55 7 * * * $HOME/.local/bin/tg-cli inject --chat-id 123456789 --sender-id cron-bot --bot --text "[CRON:morning-briefing] 生成今日晨间简报"
    ```
    > **渐进验证**：初期将 Eval Mode 设为 `observe`，在面板查看每日评估记录确认无误后，切换为 `auto` 正式推送。
 
@@ -542,7 +589,7 @@ dsh plugin --profile superagent add "link:$PWD"
 
 ### 4.3 配置受控 CLI 与工作区 `prepare` 脚本
 
-1. 将封装好的 `tg-bot`、`gcal-cli`、`mail-cli` 放入 `~/.local/bin/` 并赋予执行权限（配置文件存于 `~/.config/aura-agent/`，仅限当前 OS 用户只读）。
+1. 将封装好的 `tg-cli`、`gcal-cli`、`mail-cli` 放入 `~/.local/bin/` 并赋予执行权限（配置文件存于 `~/.config/aura-agent/`，仅限当前 OS 用户只读）。
 2. 启动服务（原生运行于 `tmux` 会话 `dsh-superagent` 中）：
    ```bash
    scripts/dsh-superagent start
@@ -555,11 +602,11 @@ dsh plugin --profile superagent add "link:$PWD"
    ln -sfn /home/ubuntu/.local/share/dsh-superagent/knowledge "$DSH_SUPERAGENT_DIR/knowledge"
    ```
 
-### 4.4 生产守护与容器化部署（`systemd` / `Docker` / `tmux`）
+### 4.4 生产守护与容器化部署（`systemd` / `tmux` / `Docker` 草案）
 
-工程同时提供三种开箱即用的生产级守护方案：
+工程提供两种已验证的守护方案，外加一份**尚未验证**的容器化草案：
 
-1. **方案 A：`systemd` 原生前台守护（云主机首选）**
+1. **方案 A：`systemd` 原生前台守护（云主机首选，已验证）**
    * 使用 [`examples/dsh-superagent.service`](../../examples/dsh-superagent.service) 直接托管前台进程 `dsh --profile superagent --no-open`，支持崩溃 5 秒自动拉起（`Restart=on-failure`）以及 `SIGINT` + `TimeoutStopSec=300` 优雅停机（确保正在运行的 Worker Session 先完成当前 Step）：
      ```bash
      loginctl enable-linger "$USER"
@@ -568,15 +615,13 @@ dsh plugin --profile superagent add "link:$PWD"
      systemctl --user daemon-reload
      systemctl --user enable --now dsh-superagent.service
      ```
-2. **方案 B：`tmux` + `systemd.timer` 自愈巡检（适合交互调试与热挂接）**
+2. **方案 B：`tmux` + `systemd.timer` 自愈巡检（适合交互调试与热挂接，已验证）**
    * 使用 [`examples/dsh-superagent-check.service`](../../examples/dsh-superagent-check.service) 与 [`examples/dsh-superagent-check.timer`](../../examples/dsh-superagent-check.timer) 每 5 分钟探测 `/orchestrator/api/state`：
      * `scripts/dsh-superagent status` 返回 `0` 时静默；
      * 返回 `1`（进程异常退出或无响应）时自动执行 `scripts/dsh-superagent --profile superagent --respect-stop restart` 恢复服务并重连中断的 Assignments。
-3. **方案 C：Docker / Docker Compose 一键容器化部署**
-   * 使用仓库根目录 [`Dockerfile`](../../Dockerfile) 与 [`examples/docker-compose.yml`](../../examples/docker-compose.yml) 一键构建并持久化挂载 `/root/.dsh` 与 `/root/.config`：
-     ```bash
-     docker compose -f examples/docker-compose.yml up -d --build
-     ```
+3. **方案 C：Docker / Docker Compose（草案，未验证）**
+   * 仓库根目录的 [`Dockerfile`](../../Dockerfile) 与 [`examples/docker-compose.yml`](../../examples/docker-compose.yml) 是**未经验证的草案**，当前不具备可直接运行的保证：Web 服务按设计拒绝绑定通配地址（见 `@deepseek-ai/dsh-host-webserver`），因此宿主机端口发布需改为 `network_mode: host`；镜像内还需另行安装 `@deepseek-ai/dsh` 与 GitHub CLI。
+   * 本项目现阶段以方案 A（`systemd`）为生产路径；容器化留待后续补齐后再写入 PRD 的部署承诺。
 
 ### 4.5 真实 Google Calendar REST API 与 IMAP/SMTP 接入配置
 
@@ -595,7 +640,7 @@ dsh plugin --profile superagent add "link:$PWD"
      }
      ```
 2. **IMAP4rev1 / SMTP 邮件客户端 (`~/.config/aura-agent/mail.json`)**：
-   * 基于 Node.js 原生 `node:tls` / `node:net` 实现 IMAP4rev1（`UID SEARCH UNSEEN` / `UID FETCH` / MIME UTF-8 解码）与 SMTP（`AUTH PLAIN` / RFC 5322 UTF-8 Base64 投递），L2 草稿保存在本地，L3 外发/删除强制校验 `--approved-by`：
+   * 基于 Node.js 原生 `node:tls` / `node:net` 实现 IMAP4rev1（`UID SEARCH UNSEEN` / `UID FETCH` / MIME UTF-8 解码）与 SMTP（`AUTH PLAIN` / RFC 5322 UTF-8 Base64 投递），L2 草稿保存在本地，L3 外发/删除强制校验 `--approved-by` 的一次性令牌（见 `scripts/aura-cli/approval.mjs`；任意字符串会被拒为 `L3_APPROVAL_INVALID`）：
      ```json
      {
        "imap": { "host": "imap.gmail.com", "port": 993, "tls": true, "user": "you@gmail.com", "pass": "APP_PASSWORD" },

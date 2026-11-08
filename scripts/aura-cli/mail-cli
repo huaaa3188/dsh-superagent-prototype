@@ -24,6 +24,7 @@ import net from 'node:net'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import tls from 'node:tls'
+import { consumeApproval } from './approval.mjs'
 
 const dataDir = process.env.AURA_DATA_DIR || join(homedir(), '.dsh', 'state', 'superagent', 'aura-data')
 const storePath = join(dataDir, 'mail-inbox.json')
@@ -442,16 +443,25 @@ function fail(code, message, tier = 'L1') {
   process.exit(code === 403 ? 2 : 1)
 }
 
-function requireL3Approval(flags, actionDesc) {
-  const approvedBy = String(flags['approved-by'] || '').trim()
-  if (!approvedBy) {
+/**
+ * Requires a Host-minted approval token bound to `action` and `target`, and consumes it.
+ * Returns the token's nonce for the audit log, so a record proves which approval was spent.
+ */
+function requireL3Approval(flags, action, target, actionDesc) {
+  const token = String(flags['approved-by'] || '').trim()
+  if (!token) {
     fail(
       403,
-      `L3_APPROVAL_REQUIRED: "${actionDesc}" 属于 L3 级对外发送/不可逆写操作。请先用 mail-cli draft 创建草稿，再调用 orchestrator_report(state: "progress", human_action: "...") 向宿主发起内联按钮审批，待宿主点击确认后携带 --approved-by <确认凭据> 执行。`,
+      `L3_APPROVAL_REQUIRED: "${actionDesc}" 属于 L3 级对外发送/不可逆写操作。请先用 mail-cli draft 创建草稿，再调用 orchestrator_report(state: "progress", human_action: "...") 向宿主发起内联按钮审批；宿主确认后由 aura-approve 签发一次性令牌（绑定 ${action} / ${target}），再携带 --approved-by <令牌> 执行。`,
       'L3',
     )
   }
-  return approvedBy
+  try {
+    const used = consumeApproval(token, action, target)
+    return `${action}:${used.nonce}`
+  } catch (error) {
+    fail(403, `${error.code || 'L3_APPROVAL_INVALID'}: ${error.message}`, 'L3')
+  }
 }
 
 async function main() {
@@ -532,7 +542,7 @@ async function main() {
   if (cmd === 'send') {
     const draftId = String(flags['draft-id'] || '').trim()
     if (!draftId) fail(400, 'Usage: mail-cli send --draft-id <id> --approved-by <confirmation>')
-    const approvedBy = requireL3Approval(flags, `对外发送邮件草稿 ${draftId}`)
+    const approvedBy = requireL3Approval(flags, 'mail.send', draftId, `对外发送邮件草稿 ${draftId}`)
     const idx = store.drafts.findIndex(d => d.id === draftId)
     if (idx < 0) fail(404, `Draft not found: ${draftId}`, 'L3')
     const [draft] = store.drafts.splice(idx, 1)
@@ -574,7 +584,7 @@ async function main() {
   if (cmd === 'delete') {
     const id = String(flags.id || '').trim()
     if (!id) fail(400, 'Usage: mail-cli delete --id <msgId> --approved-by <confirmation>')
-    const approvedBy = requireL3Approval(flags, `永久删除邮件 ${id}`)
+    const approvedBy = requireL3Approval(flags, 'mail.delete', id, `永久删除邮件 ${id}`)
     if (mailCfg.imap.enabled && id.startsWith('imap_')) {
       const removed = await imapDeleteMessage(mailCfg.imap, id)
       store.auditLog.push({ at: new Date().toISOString(), action: 'delete', provider: 'imap', id, subject: removed.subject, approvedBy })

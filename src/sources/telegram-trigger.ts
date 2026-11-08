@@ -1,6 +1,6 @@
 /** Normalizes Telegram Bot updates (messages, replies, and inline button callbacks) into domain Triggers. */
 import { z } from 'zod'
-import { key, type ChannelRef, type Trigger } from '../core/index.ts'
+import { key, threadKey, type ChannelRef, type Trigger } from '../core/index.ts'
 
 export const SOURCE = 'telegram'
 
@@ -52,6 +52,29 @@ export function telegramTime(value: string): string {
   const millis = Number.isFinite(numeric) ? (value.length <= 10 ? numeric * 1000 : numeric) : Date.parse(value)
   if (!Number.isFinite(millis)) throw new Error(`Unreadable Telegram message time: ${value}`)
   return new Date(millis).toISOString()
+}
+
+/** Parses a Telegram message reference into Thread keys and search terms, mirroring how `github.ts` resolves `#12`. */
+export function telegramFind(query: string): { threads: string[]; terms: string[] } {
+  const threads = new Set<string>()
+  const terms = new Set<string>()
+  const found = (chatId: string | undefined, messageId: string): void => {
+    terms.add(messageId)
+    if (chatId) threads.add(threadKey({ source: SOURCE, id: telegramThreadId(chatId, undefined, messageId) }))
+  }
+  // `https://t.me/c/<internal>/<message>`: a supergroup message, whose chat id is the internal id behind `-100`.
+  for (const match of query.matchAll(/https?:\/\/t\.me\/c\/(\d+)\/(\d+)/g)) {
+    if (match[1] && match[2]) found(`-100${match[1]}`, match[2])
+  }
+  // `https://t.me/<username>/<message>`: a public channel message, which carries a username rather than a chat id.
+  for (const match of query.matchAll(/https?:\/\/t\.me\/[A-Za-z][A-Za-z0-9_]{3,}\/(\d+)/g)) {
+    if (match[1]) found(undefined, match[1])
+  }
+  // `tg://openmessage?user_id=<chat>&message_id=<message>`: what this Source writes for private chats.
+  for (const match of query.matchAll(/tg:\/\/openmessage\?[^\s]*?user_id=(-?\d+)[^\s]*?message_id=(\d+)/g)) {
+    if (match[1] && match[2]) found(match[1], match[2])
+  }
+  return { threads: [...threads], terms: [...terms] }
 }
 
 /** Converts one validated Telegram update item into a Trigger, returning undefined for messages sent by the bot itself. */

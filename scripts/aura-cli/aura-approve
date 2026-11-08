@@ -1,0 +1,77 @@
+#!/usr/bin/env node
+/**
+ * aura-approve: mints L3 approval tokens for Project Aura.
+ *
+ * This is a Host-side tool. Run it when a person approves an L3 action, then pass the
+ * printed token to the acting CLI through `--approved-by`. Tokens are bound to one action
+ * and one target, expire in five minutes by default, and work once.
+ *
+ * Commands:
+ *   aura-approve keygen                              Create the HMAC key if it does not exist.
+ *   aura-approve issue --action <name> --target <id> [--ttl <seconds>]
+ *   aura-approve verify --action <name> --target <id> --token <token>   Dry run; consumes the token.
+ *
+ * Actions: gcal.commit-draft, gcal.reschedule, gcal.delete, mail.send, mail.delete.
+ */
+import { approvalKeyPath, approvalKey, createApprovalKey, consumeApproval, issueApproval } from './approval.mjs'
+
+const ACTIONS = ['gcal.commit-draft', 'gcal.reschedule', 'gcal.delete', 'mail.send', 'mail.delete']
+
+function parseArgs(argv) {
+  const args = argv.slice(2)
+  const cmd = args[0] || 'help'
+  const flags = {}
+  for (let i = 1; i < args.length; i++) {
+    const a = args[i]
+    if (!a.startsWith('--')) continue
+    const k = a.slice(2)
+    const next = args[i + 1]
+    if (!next || next.startsWith('--')) flags[k] = true
+    else { flags[k] = next; i++ }
+  }
+  return { cmd, flags }
+}
+
+function fail(code, message) {
+  process.stderr.write(JSON.stringify({ error: { code, message } }) + '\n')
+  process.exit(1)
+}
+
+function requireAction(flags) {
+  const action = String(flags.action || '').trim()
+  if (!ACTIONS.includes(action)) fail('USAGE', `--action must be one of: ${ACTIONS.join(', ')}`)
+  const target = String(flags.target || '').trim()
+  if (!target) fail('USAGE', '--target is required and names the exact object the approval covers.')
+  return { action, target }
+}
+
+const { cmd, flags } = parseArgs(process.argv)
+
+if (cmd === 'keygen') {
+  if (approvalKey()) {
+    process.stdout.write(JSON.stringify({ ok: true, created: false, path: approvalKeyPath }) + '\n')
+  } else {
+    createApprovalKey()
+    process.stdout.write(JSON.stringify({ ok: true, created: true, path: approvalKeyPath }) + '\n')
+  }
+} else if (cmd === 'issue') {
+  const { action, target } = requireAction(flags)
+  const ttl = flags.ttl === undefined ? 300 : Number(flags.ttl)
+  if (!Number.isFinite(ttl) || ttl <= 0 || ttl > 86_400) fail('USAGE', '--ttl is seconds, greater than 0 and at most 86400.')
+  const token = issueApproval(action, target, { ttlMs: Math.round(ttl * 1000) })
+  process.stdout.write(JSON.stringify({ ok: true, action, target, ttl_seconds: Math.round(ttl), token }) + '\n')
+} else if (cmd === 'verify') {
+  const { action, target } = requireAction(flags)
+  try {
+    const used = consumeApproval(flags.token, action, target)
+    process.stdout.write(JSON.stringify({ ok: true, consumed: used }) + '\n')
+  } catch (error) {
+    fail(error.code || 'L3_APPROVAL_INVALID', error.message)
+  }
+} else {
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    usage: ['aura-approve keygen', 'aura-approve issue --action <name> --target <id> [--ttl <seconds>]', 'aura-approve verify --action <name> --target <id> --token <token>'],
+    actions: ACTIONS,
+  }) + '\n')
+}

@@ -20,6 +20,15 @@ const configDir = process.env.TG_CLI_CONFIG_DIR || join(homedir(), '.config', 't
 const configPath = join(configDir, 'config.json')
 const statePath = join(configDir, 'state.json')
 
+/**
+ * Local `inject` events live in their own cursor range so a live Telegram `update_id` can never overtake them.
+ * Real update ids are small and monotonic; injected ids start far above any plausible Telegram id and stay ordered
+ * among themselves, so `pull --after <cursor>` drains injections first and then the live queue, whichever advances.
+ */
+const INJECTED_ID_BASE = 1_000_000_000_000
+/** A `pull` cursor below the injected range means "no injected event has been read yet". */
+const injectedFloor = after => (after < INJECTED_ID_BASE ? INJECTED_ID_BASE : after)
+
 function loadJson(path, fallback) {
   try {
     return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : fallback
@@ -64,9 +73,10 @@ function sleep(ms) {
 async function tgApi(token, method, body, options = {}) {
   const maxRetries = options.retries ?? 3
   const timeoutMs = options.timeoutMs ?? 35_000
+  const apiBase = (process.env.TELEGRAM_API_BASE || 'https://api.telegram.org').replace(/\/+$/, '')
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+      const res = await fetch(`${apiBase}/bot${token}/${method}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -205,13 +215,16 @@ async function main() {
   const botId = String(config.botId || process.env.TELEGRAM_BOT_ID || 'telegram-bot')
   const botUsername = String(config.botUsername || process.env.TELEGRAM_BOT_USERNAME || 'aura_bot')
   const token = config.botToken || process.env.TELEGRAM_BOT_TOKEN
+  // Older state files were written before the injected queue and its cursor existed.
+  state.injected = Array.isArray(state.injected) ? state.injected : []
+  state.nextInjectedId = Number(state.nextInjectedId) || INJECTED_ID_BASE
 
   if (cmd === 'inject') {
     const chatId = String(flags['chat-id'] || '')
     const senderId = String(flags['sender-id'] || 'cron-bot')
     const text = String(flags.text || '')
     if (!chatId || !text) fail(400, 'Usage: tg-cli inject --chat-id <id> --sender-id <id> [--bot] --text <text>')
-    const updateId = Math.max(state.nextUpdateId || 1, ...state.injected.map(u => u.update_id + 1), 1)
+    const updateId = Math.max(injectedFloor(state.nextUpdateId || 1), ...state.injected.map(u => u.update_id + 1))
     const msgId = `inj_${updateId}`
     const rootId = String(flags['root-id'] || msgId)
     const item = {
@@ -227,7 +240,9 @@ async function main() {
       at: new Date().toISOString(),
     }
     state.injected.push(item)
-    state.nextUpdateId = updateId + 1
+    // The injected cursor advances on its own. Writing `nextUpdateId` here would hand the live `getUpdates` offset an
+    // id far above every real one, which makes Telegram skip all pending updates.
+    state.nextInjectedId = Math.max(Number(state.nextInjectedId) || INJECTED_ID_BASE, updateId + 1)
     recordThreadItem(state, item)
     saveJson(statePath, state)
     process.stdout.write(JSON.stringify({ ok: true, injected: item }) + '\n')
@@ -237,36 +252,26 @@ async function main() {
   if (cmd === 'pull') {
     const after = Number(flags.after || 0)
     const items = []
-    let next = Math.max(after, state.nextUpdateId || 1)
 
-    // 1. Drain locally injected items with update_id >= after
-    const remainingInjected = []
-    for (const item of state.injected || []) {
-      if (item.update_id >= after) {
-        items.push(item)
-        if (item.update_id + 1 > next) next = item.update_id + 1
-      } else {
-        remainingInjected.push(item)
-      }
-    }
-    state.injected = remainingInjected
-
-    // 2. If a live Telegram Bot token is configured, poll getUpdates
+    // 1. Read the live queue first, because the network wait is the only moment another `tg-cli` may commit a state
+    // write of its own (an `inject` from cron, or a `reply` recording its root message). Rebasing onto that newer
+    // state after the wait keeps those writes instead of overwriting them with this process's stale snapshot.
+    let live = state
     if (token) {
+      // A cursor in the injected range carries no information about the live queue, so the live position stays where
+      // the last live read left it. Sending an injected-range offset to `getUpdates` would silently skip every later
+      // real update, whose ids are far below it.
+      const offset = after < INJECTED_ID_BASE ? after : (state.nextUpdateId || 0)
       const updates = await tgApi(token, 'getUpdates', {
-        offset: after,
+        offset,
         timeout: Number(flags.timeout || 1),
         allowed_updates: ['message', 'edited_message', 'callback_query'],
       })
-      // Reload state after network wait so concurrent `tg-cli reply` writes to messageRoots/sentKeys are never overwritten.
-      const latest = loadJson(statePath, { nextUpdateId: 1, sentKeys: {}, injected: [], threads: {}, messageRoots: {} })
-      state.sentKeys = { ...(latest.sentKeys || {}), ...(state.sentKeys || {}) }
-      state.messageRoots = { ...(latest.messageRoots || {}), ...(state.messageRoots || {}) }
-      state.threads = { ...(latest.threads || {}), ...(state.threads || {}) }
-
+      live = loadJson(statePath, { nextUpdateId: 1, nextInjectedId: INJECTED_ID_BASE, sentKeys: {}, injected: [], threads: {}, messageRoots: {} })
+      let liveNext = Math.max(offset, live.nextUpdateId || 0)
       for (const u of updates) {
-        if (u.update_id + 1 > next) next = u.update_id + 1
-        const normalized = normalizeUpdate(u, { id: botId, username: botUsername }, state)
+        if (u.update_id + 1 > liveNext) liveNext = u.update_id + 1
+        const normalized = normalizeUpdate(u, { id: botId, username: botUsername }, live)
         if (!normalized) continue
         if (normalized.callback_query_id) {
           await tgApi(token, 'answerCallbackQuery', {
@@ -281,13 +286,34 @@ async function main() {
             }).catch(() => {})
           }
         }
-        recordThreadItem(state, normalized)
+        recordThreadItem(live, normalized)
         items.push(normalized)
       }
+      live.nextUpdateId = liveNext
     }
 
-    state.nextUpdateId = next
-    saveJson(statePath, state)
+    // 2. Drain the injected queue from the rebased state, so an event injected during the wait above is still read.
+    const injectedAfter = injectedFloor(after)
+    const remainingInjected = []
+    let injectedNext = 0
+    for (const item of live.injected || []) {
+      const id = Number(item.update_id)
+      if (!Number.isFinite(id) || id < injectedAfter) { remainingInjected.push(item); continue }
+      items.push(item)
+      if (id + 1 > injectedNext) injectedNext = id + 1
+    }
+    live.injected = remainingInjected
+    live.nextInjectedId = Math.max(Number(live.nextInjectedId) || INJECTED_ID_BASE, injectedNext)
+
+    // The cursor advances along the queue that actually produced items, newest first: an injected event wins while
+    // any remains, so a live `update_id` never steps over one. A pull that yields nothing keeps the caller's cursor.
+    const next = injectedNext > 0
+      ? injectedNext
+      : items.length
+        ? Math.max(after, live.nextUpdateId || 0)
+        : after
+
+    saveJson(statePath, live)
     process.stdout.write(JSON.stringify({ me: botId, items, next }) + '\n')
     return
   }

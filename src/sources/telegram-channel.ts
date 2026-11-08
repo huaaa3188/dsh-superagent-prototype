@@ -1,12 +1,11 @@
 /** Telegram outbound channel: sends idempotent threaded replies and inline approval keyboards through tg-cli. */
 import { latestAssignment, type OutboundMessage } from '../core/index.ts'
 import { CliError } from '../infra/commands.ts'
-import { wordCount } from '../infra/text.ts'
+import { checkedImText } from '../infra/text.ts'
 import type { SourceContext } from './host.ts'
 import type { ChannelLink } from './kind.ts'
 import { telegramTriggerId } from './telegram-trigger.ts'
 
-const TELEGRAM_MAX_WORDS = 300
 const BUTTONS_RE = /<!--\s*buttons:\s*\[[\s\S]*?\]\s*-->/
 
 /**
@@ -28,10 +27,7 @@ export async function sendTelegram(
   const { chatId, messageId, threadId } = message.channel.address
   if (!chatId || !messageId) throw new Error('Missing Telegram reply target')
   const visibleText = message.text.replace(/<!--\s*buttons:\s*\[[\s\S]*?\]\s*-->/g, '').trim() || message.text
-  const count = wordCount(visibleText)
-  if (count > TELEGRAM_MAX_WORDS) {
-    throw new Error(`Telegram message has ${count} words; maximum is ${TELEGRAM_MAX_WORDS}. Rewrite as a concise card.`)
-  }
+  checkedImText(visibleText)
   let text = message.text
   if (message.kind === 'reply' && !BUTTONS_RE.test(text) && message.ticketId && host.tickets) {
     const ticket = host.tickets.get(message.ticketId)
@@ -58,9 +54,23 @@ export async function sendTelegram(
   }
 }
 
+/**
+ * Best-effort message link for a Telegram Channel address.
+ * `tg-cli` does not report a link for every update, so synthesize one: private chats deep-link through the `tg://`
+ * scheme, groups and supergroups through their `t.me/c/<chat>/<message>` form.
+ */
+const telegramUrl = (address: Record<string, string>): string => {
+  if (address.url) return address.url
+  const { chatId, messageId } = address
+  if (!chatId || !messageId) return ''
+  const topic = address.threadId ? `?thread=${address.threadId}` : ''
+  if (chatId.startsWith('-')) return `https://t.me/c/${chatId.slice(1)}/${messageId}${topic}`
+  return `tg://openmessage?user_id=${chatId}&message_id=${messageId}`
+}
+
 /** Constructs the panel display link for a Telegram Channel address. */
 export const telegramLink = (address: Record<string, string>): ChannelLink => ({
-  url: address.url ?? '',
+  url: telegramUrl(address),
   label: { zh: 'Telegram 消息', en: 'Telegram message' },
   ...(address.chatId && address.messageId ? { triggerId: telegramTriggerId(address.chatId, address.messageId) } : {}),
 })

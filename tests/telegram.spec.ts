@@ -1,6 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { execFile, execFileSync } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
@@ -234,6 +234,12 @@ describe('Telegram Source', () => {
       label: { zh: 'Telegram 消息', en: 'Telegram message' },
       triggerId: telegramTriggerId(ALLOWED_USER, '101'),
     })
+    // `tg-cli` never reports a link, so the Channel address alone must still produce a usable one.
+    expect(telegramLink({ chatId: ALLOWED_USER, messageId: '101' }).url)
+      .toBe(`tg://openmessage?user_id=${ALLOWED_USER}&message_id=101`)
+    expect(telegramLink({ chatId: GROUP_CHAT, messageId: '55' }).url).toBe('https://t.me/c/100112233/55')
+    expect(telegramLink({ chatId: GROUP_CHAT, messageId: '55', threadId: '9' }).url).toBe('https://t.me/c/100112233/55?thread=9')
+    expect(telegramLink({ chatId: ALLOWED_USER }).url).toBe('')
     h.store.close()
   })
 
@@ -290,8 +296,25 @@ describe('Telegram Source', () => {
     const trigger = telegramTrigger(message('101'), BOT_ID)!
     expect(telegramKind.environment!.values({ deployment: testDeployment(), config: telegramKind.schema.parse({}), trigger }))
       .toEqual({ DSH_SUPERAGENT_TELEGRAM_CHAT: ALLOWED_USER })
-    expect(telegramKind.find!('check tgmsg_42 and tgmsg_42')).toEqual({ threads: [], terms: ['tgmsg_42'] })
     h.store.close()
+  })
+
+  it('resolves Telegram message references into Thread keys and search terms', () => {
+    // A supergroup link names the internal id behind the `-100` prefix, so the thread key is the real chat id.
+    expect(telegramKind.find!('see https://t.me/c/112233/101 for details'))
+      .toEqual({ threads: ['telegram:-100112233:101'], terms: ['101'] })
+    // A public channel link carries a username rather than a chat id; the message id still searches exactly.
+    expect(telegramKind.find!('https://t.me/aurabot/77')).toEqual({ threads: [], terms: ['77'] })
+    // The private-chat deep link this Source writes links back to the conversation it came from.
+    expect(telegramKind.find!(`tg://openmessage?user_id=${ALLOWED_USER}&message_id=101`))
+      .toEqual({ threads: [`telegram:${ALLOWED_USER}:101`], terms: ['101'] })
+    expect(telegramKind.find!('look at https://t.me/c/112233/42.')).toEqual({
+      threads: ['telegram:-100112233:42'],
+      terms: ['42'],
+    })
+    // `#42` is the GitHub numbering convention and names no Telegram message.
+    expect(telegramKind.find!('#42')).toEqual({ threads: [], terms: [] })
+    expect(telegramKind.find!('nothing to resolve here')).toEqual({ threads: [], terms: [] })
   })
 
   it('registers the kind on apply, reports setupPending while unconfigured, and unregisters cleanly on dispose', async () => {
@@ -376,12 +399,20 @@ describe('Telegram Source', () => {
     tempDirs.push(dataDir)
     const gcalPath = resolve(import.meta.dirname, '../scripts/aura-cli/gcal-cli')
     const mailPath = resolve(import.meta.dirname, '../scripts/aura-cli/mail-cli')
+    const approvePath = resolve(import.meta.dirname, '../scripts/aura-cli/aura-approve')
+    const approvalEnv = { AURA_DATA_DIR: dataDir, AURA_APPROVAL_KEY_FILE: join(dataDir, 'approval.key') }
     const run = (cli: string, args: string[]) => JSON.parse(
       execFileSync(process.execPath, [cli, ...args], {
-        env: { ...process.env, AURA_DATA_DIR: dataDir },
+        env: { ...process.env, ...approvalEnv },
         encoding: 'utf8',
       }),
     )
+    // L3 operations need a token minted by the Host-side tool; a free-form string must not pass.
+    run(approvePath, ['keygen'])
+    const approve = (action: string, target: string) => run(
+      approvePath,
+      ['issue', '--action', action, '--target', target],
+    ).token as string
 
     // 1. gcal-cli L1 read + conflict detection
     const listed = run(gcalPath, ['list'])
@@ -397,15 +428,34 @@ describe('Telegram Source', () => {
     const gtdDone = run(gcalPath, ['gtd-done', '--id', gtdAdded.todo.id])
     expect(gtdDone).toMatchObject({ ok: true, tier: 'L2', todo: { status: 'done' } })
 
-    // 3. gcal-cli L3 mutation blocked without --approved-by, succeeds with --approved-by
+    // 3. gcal-cli L3 mutation blocked without a token, and a forged string is rejected outright
     expect(() => run(gcalPath, ['reschedule', '--event-id', 'evt_3', '--start', '16:00', '--end', '17:00']))
       .toThrow(/L3_APPROVAL_REQUIRED/)
-    const rescheduled = run(gcalPath, [
+    expect(() => run(gcalPath, [
       'reschedule', '--event-id', 'evt_3', '--start', '16:00', '--end', '17:00',
       '--approved-by', 'approve:reschedule_evt_3',
+    ])).toThrow(/L3_APPROVAL_INVALID/)
+    // A token is bound to its target: approving a different slot must not authorize this one.
+    expect(() => run(gcalPath, [
+      'reschedule', '--event-id', 'evt_3', '--start', '16:00', '--end', '17:00',
+      '--approved-by', approve('gcal.reschedule', 'evt_3 09:00-10:00'),
+    ])).toThrow(/L3_APPROVAL_MISMATCH/)
+
+    const rescheduleToken = approve('gcal.reschedule', 'evt_3 16:00-17:00')
+    const rescheduled = run(gcalPath, [
+      'reschedule', '--event-id', 'evt_3', '--start', '16:00', '--end', '17:00',
+      '--approved-by', rescheduleToken,
     ])
     expect(rescheduled).toMatchObject({ ok: true, tier: 'L3', event: { id: 'evt_3', start: '16:00', end: '17:00' } })
+    // The audit value is the spent nonce, so a log line proves which approval was consumed.
+    expect(rescheduled.approvedBy).toMatch(/^gcal\.reschedule:[0-9a-f]{24}$/)
     expect(run(gcalPath, ['conflicts']).conflicts).toHaveLength(0)
+
+    // A spent token stays spent: replaying the same string must not reschedule anything again.
+    expect(() => run(gcalPath, [
+      'reschedule', '--event-id', 'evt_3', '--start', '16:00', '--end', '17:00',
+      '--approved-by', rescheduleToken,
+    ])).toThrow(/L3_APPROVAL_REUSED/)
 
     // 4. mail-cli L1 unread + L2 draft + L3 send gate
     const unread = run(mailPath, ['unread'])
@@ -421,13 +471,143 @@ describe('Telegram Source', () => {
 
     expect(() => run(mailPath, ['send', '--draft-id', mailDraft.draft.id]))
       .toThrow(/L3_APPROVAL_REQUIRED/)
-    const sent = run(mailPath, [
+    expect(() => run(mailPath, [
       'send', '--draft-id', mailDraft.draft.id,
       '--approved-by', 'approve:send_mail_draft',
+    ])).toThrow(/L3_APPROVAL_INVALID/)
+    const sent = run(mailPath, [
+      'send', '--draft-id', mailDraft.draft.id,
+      '--approved-by', approve('mail.send', mailDraft.draft.id),
     ])
     expect(sent).toMatchObject({ ok: true, tier: 'L3', sent: { to: 'partner@tech-summit.example.org' } })
     expect(run(mailPath, ['unread']).count).toBe(1)
   })
+
+  it('never lets an injected event be overtaken by the live update_id cursor, and never advances the live cursor itself', () => {
+    const configDir = mkdtempSync(join(tmpdir(), 'tg-cli-cursor-test-'))
+    tempDirs.push(configDir)
+    const cliPath = resolve(import.meta.dirname, '../scripts/aura-cli/tg-cli')
+    const runCli = (args: string[]) => JSON.parse(
+      execFileSync(process.execPath, [cliPath, ...args], {
+        env: { ...process.env, TG_CLI_CONFIG_DIR: configDir },
+        encoding: 'utf8',
+      }),
+    )
+    const stateFile = join(configDir, 'state.json')
+
+    // A live poll has already advanced the plugin's cursor past every plausible injected id.
+    writeFileSync(stateFile, JSON.stringify({
+      nextUpdateId: 50005,
+      sentKeys: {},
+      injected: [],
+      threads: {},
+      messageRoots: {},
+    }))
+
+    const injected = runCli([
+      'inject',
+      '--chat-id', ALLOWED_USER,
+      '--sender-id', 'cron-bot',
+      '--text', 'Morning briefing',
+    ])
+    expect(injected.ok).toBe(true)
+    // The injected id must sit above the injected base, not at the live cursor.
+    expect(injected.injected.update_id).toBeGreaterThanOrEqual(1_000_000_000_000)
+
+    // Injecting must not touch the live cursor: a huge `getUpdates` offset makes Telegram skip real updates.
+    const afterInject = JSON.parse(readFileSync(stateFile, 'utf8'))
+    expect(afterInject.nextUpdateId).toBe(50005)
+
+    // Regression: a plugin sitting at cursor 50005 used to see an empty pull and lose the briefing silently.
+    const pulled = runCli(['pull', '--after', '50005', '--json'])
+    expect(pulled.items).toHaveLength(1)
+    expect(pulled.items[0]).toMatchObject({ text: 'Morning briefing', sender: { id: 'cron-bot' } })
+    expect(pulled.next).toBeGreaterThanOrEqual(1_000_000_000_000)
+
+    // The cursor returned above must not re-deliver the same event.
+    const again = runCli(['pull', '--after', String(pulled.next), '--json'])
+    expect(again.items).toHaveLength(0)
+    expect(again.next).toBe(pulled.next)
+
+    // And the live cursor still stands where the last real poll left it.
+    expect(JSON.parse(readFileSync(stateFile, 'utf8')).nextUpdateId).toBe(50005)
+  })
+
+  it('keeps an event injected during a live getUpdates wait instead of overwriting it with the poller snapshot', async () => {
+    const configDir = mkdtempSync(join(tmpdir(), 'tg-cli-race-test-'))
+    tempDirs.push(configDir)
+    const cliPath = resolve(import.meta.dirname, '../scripts/aura-cli/tg-cli')
+
+    // A local stand-in for the Bot API holds `getUpdates` open, so the cron timer can fire inside the poll window.
+    let releasePoll: () => void = () => {}
+    const pollGate = new Promise<void>(resolvePoll => { releasePoll = resolvePoll })
+    const server = http.createServer((req, res) => {
+      let body = ''
+      req.on('data', chunk => { body += chunk })
+      req.on('end', async () => {
+        if (req.url?.endsWith('/getUpdates')) {
+          await pollGate
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ok: true, result: [] }))
+          return
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, result: true }))
+      })
+    })
+    await new Promise<void>(resolveListen => server.listen(0, '127.0.0.1', resolveListen))
+    const port = (server.address() as net.AddressInfo).port
+
+    const env = {
+      ...process.env,
+      TG_CLI_CONFIG_DIR: configDir,
+      TELEGRAM_API_BASE: `http://127.0.0.1:${port}`,
+    }
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify({
+      botToken: '000000:race-test-token',
+      botId: BOT_ID,
+      botUsername: 'aura_bot',
+    }))
+    writeFileSync(join(configDir, 'state.json'), JSON.stringify({
+      nextUpdateId: 700,
+      sentKeys: {},
+      injected: [],
+      threads: {},
+      messageRoots: {},
+    }))
+
+    let pulled = ''
+    try {
+      // `pull` reads state at startup, blocks on the network, then re-reads state before writing. Injecting inside that
+      // window models the cron timer firing mid-poll.
+      const pulling = execFileAsync(process.execPath, [cliPath, 'pull', '--after', '0', '--json', '--timeout', '1'], { env })
+      await new Promise(resolveWait => setTimeout(resolveWait, 200))
+      execFileSync(process.execPath, [
+        cliPath, 'inject',
+        '--chat-id', ALLOWED_USER,
+        '--sender-id', 'cron-bot',
+        '--text', 'Injected mid-poll',
+      ], { env, encoding: 'utf8' })
+      releasePoll()
+      pulled = (await pulling).stdout
+    } finally {
+      releasePoll()
+      await new Promise<void>(resolveClose => server.close(() => resolveClose()))
+    }
+
+    // The stale pre-poll snapshot used to be written back here, so the injection vanished without an error: the pull
+    // returned nothing and the event was gone for good.
+    const result = JSON.parse(pulled)
+    expect(result.items).toHaveLength(1)
+    expect(result.items[0]).toMatchObject({ text: 'Injected mid-poll', sender: { id: 'cron-bot' } })
+    expect(result.next).toBeGreaterThanOrEqual(1_000_000_000_000)
+
+    const state = JSON.parse(readFileSync(join(configDir, 'state.json'), 'utf8'))
+    // Delivered, and therefore drained exactly once.
+    expect(state.injected).toHaveLength(0)
+    // Nor may the poll's state write roll the live cursor backwards.
+    expect(state.nextUpdateId).toBe(700)
+  }, 20_000)
 
   it('supports Phase 3 proactive cron triggers (aura-cron) and L3 cold archive indexing/search (aura-kb)', () => {
     const configDir = mkdtempSync(join(tmpdir(), 'aura-cron-test-'))
@@ -526,6 +706,18 @@ describe('Telegram Source', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'aura-gcal-api-'))
     tempDirs.push(dataDir)
     const gcalPath = resolve(import.meta.dirname, '../scripts/aura-cli/gcal-cli')
+    const approvePath = resolve(import.meta.dirname, '../scripts/aura-cli/aura-approve')
+    const approvalEnv = {
+      AURA_DATA_DIR: dataDir,
+      AURA_APPROVAL_KEY_FILE: join(dataDir, 'approval.key'),
+    }
+    const runApprove = (args: string[]) => JSON.parse(
+      execFileSync(process.execPath, [approvePath, ...args], {
+        env: { ...process.env, ...approvalEnv },
+        encoding: 'utf8',
+      }),
+    )
+    runApprove(['keygen'])
 
     let listAttempts = 0
     const remoteEvents = [
@@ -601,7 +793,7 @@ describe('Telegram Source', () => {
 
     const runGcal = async (args: string[]) => {
       const { stdout } = await execFileAsync(process.execPath, [gcalPath, ...args], {
-        env: { ...process.env, AURA_DATA_DIR: dataDir, AURA_GCAL_CONFIG: configFile },
+        env: { ...process.env, ...approvalEnv, AURA_GCAL_CONFIG: configFile },
         encoding: 'utf8',
       })
       return JSON.parse(stdout)
@@ -616,7 +808,8 @@ describe('Telegram Source', () => {
       expect(listed.conflicts[0].overlapMinutes).toBe(30)
 
       const draft = await runGcal(['draft-add', '--date', '2026-11-07', '--title', '新增云端日程', '--start', '15:00', '--end', '16:00'])
-      const committed = await runGcal(['commit-draft', '--draft-id', draft.draft.id, '--approved-by', 'approve:commit_1'])
+      const commitToken = runApprove(['issue', '--action', 'gcal.commit-draft', '--target', draft.draft.id]).token as string
+      const committed = await runGcal(['commit-draft', '--draft-id', draft.draft.id, '--approved-by', commitToken])
       expect(committed).toMatchObject({
         ok: true,
         tier: 'L3',
@@ -632,6 +825,18 @@ describe('Telegram Source', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'aura-mail-api-'))
     tempDirs.push(dataDir)
     const mailPath = resolve(import.meta.dirname, '../scripts/aura-cli/mail-cli')
+    const approvePath = resolve(import.meta.dirname, '../scripts/aura-cli/aura-approve')
+    const approvalEnv = {
+      AURA_DATA_DIR: dataDir,
+      AURA_APPROVAL_KEY_FILE: join(dataDir, 'approval.key'),
+    }
+    const runApprove = (args: string[]) => JSON.parse(
+      execFileSync(process.execPath, [approvePath, ...args], {
+        env: { ...process.env, ...approvalEnv },
+        encoding: 'utf8',
+      }),
+    )
+    runApprove(['keygen'])
 
     const smtpReceived: string[] = []
 
@@ -717,7 +922,7 @@ describe('Telegram Source', () => {
 
     const runMail = async (args: string[]) => {
       const { stdout } = await execFileAsync(process.execPath, [mailPath, ...args], {
-        env: { ...process.env, AURA_DATA_DIR: dataDir, AURA_MAIL_CONFIG: mailCfgPath },
+        env: { ...process.env, ...approvalEnv, AURA_MAIL_CONFIG: mailCfgPath },
         encoding: 'utf8',
       })
       return JSON.parse(stdout)
@@ -740,10 +945,11 @@ describe('Telegram Source', () => {
         '--subject', 'Re: 真实 IMAP 账单通知',
         '--body', '已确认账单无误，请按期扣款。',
       ])
+      const sendToken = runApprove(['issue', '--action', 'mail.send', '--target', draft.draft.id]).token as string
       const sent = await runMail([
         'send',
         '--draft-id', draft.draft.id,
-        '--approved-by', 'approve:smtp_send_1',
+        '--approved-by', sendToken,
       ])
       expect(sent).toMatchObject({
         ok: true,

@@ -25,6 +25,7 @@ import { createSign } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { consumeApproval } from './approval.mjs'
 
 const dataDir = process.env.AURA_DATA_DIR || join(homedir(), '.dsh', 'state', 'superagent', 'aura-data')
 const storePath = join(dataDir, 'calendar-gtd.json')
@@ -380,16 +381,25 @@ function detectConflicts(events) {
   return conflicts
 }
 
-function requireL3Approval(flags, actionDesc) {
-  const approvedBy = String(flags['approved-by'] || '').trim()
-  if (!approvedBy) {
+/**
+ * Requires a Host-minted approval token bound to `action` and `target`, and consumes it.
+ * Returns the token's nonce for the audit log, so a record proves which approval was spent.
+ */
+function requireL3Approval(flags, action, target, actionDesc) {
+  const token = String(flags['approved-by'] || '').trim()
+  if (!token) {
     fail(
       403,
-      `L3_APPROVAL_REQUIRED: "${actionDesc}" 属于 L3 级不可逆/日程变更操作。请先调用 orchestrator_report(state: "progress", human_action: "...") 向宿主发起内联按钮审批，待宿主在 Telegram 点击确认或回复同意后，携带 --approved-by <确认凭据或回调内容> 重新执行。`,
+      `L3_APPROVAL_REQUIRED: "${actionDesc}" 属于 L3 级不可逆/日程变更操作。请先调用 orchestrator_report(state: "progress", human_action: "...") 向宿主发起内联按钮审批；宿主确认后由 aura-approve 签发一次性令牌（绑定 ${action} / ${target}），再携带 --approved-by <令牌> 重新执行。`,
       'L3',
     )
   }
-  return approvedBy
+  try {
+    const used = consumeApproval(token, action, target)
+    return `${action}:${used.nonce}`
+  } catch (error) {
+    fail(403, `${error.code || 'L3_APPROVAL_INVALID'}: ${error.message}`, 'L3')
+  }
 }
 
 async function main() {
@@ -450,7 +460,7 @@ async function main() {
   if (cmd === 'commit-draft') {
     const draftId = String(flags['draft-id'] || '').trim()
     if (!draftId) fail(400, 'Usage: gcal-cli commit-draft --draft-id <id> --approved-by <confirmation>')
-    const approvedBy = requireL3Approval(flags, `正式写入日程草稿 ${draftId}`)
+    const approvedBy = requireL3Approval(flags, 'gcal.commit-draft', draftId, `正式写入日程草稿 ${draftId}`)
     const idx = store.drafts.findIndex(d => d.id === draftId)
     if (idx < 0) fail(404, `Draft not found: ${draftId}`, 'L3')
     const [draft] = store.drafts.splice(idx, 1)
@@ -478,7 +488,7 @@ async function main() {
     const start = String(flags.start || '').trim()
     const end = String(flags.end || '').trim()
     if (!eventId || !start || !end) fail(400, 'Usage: gcal-cli reschedule --event-id <id> --start <HH:MM> --end <HH:MM> --approved-by <confirmation>')
-    const approvedBy = requireL3Approval(flags, `改期日程 ${eventId} 至 ${start}-${end}`)
+    const approvedBy = requireL3Approval(flags, 'gcal.reschedule', `${eventId} ${start}-${end}`, `改期日程 ${eventId} 至 ${start}-${end}`)
     if (gcal.enabled) {
       const updated = await gcalPatchEvent(gcal, eventId, date, start, end)
       store.auditLog.push({
@@ -505,14 +515,14 @@ async function main() {
     if (flags.date) event.date = String(flags.date)
     store.auditLog.push({ at: new Date().toISOString(), action: 'reschedule', target: eventId, previous, next: { start, end, date: event.date }, approvedBy })
     saveStore(store)
-    process.stdout.write(JSON.stringify({ ok: true, tier: 'L3', provider: 'local', event, previous }) + '\n')
+    process.stdout.write(JSON.stringify({ ok: true, tier: 'L3', provider: 'local', event, previous, approvedBy }) + '\n')
     return
   }
 
   if (cmd === 'delete') {
     const eventId = String(flags['event-id'] || '').trim()
     if (!eventId) fail(400, 'Usage: gcal-cli delete --event-id <id> --approved-by <confirmation>')
-    const approvedBy = requireL3Approval(flags, `删除日程 ${eventId}`)
+    const approvedBy = requireL3Approval(flags, 'gcal.delete', eventId, `删除日程 ${eventId}`)
     if (gcal.enabled) {
       const removed = await gcalDeleteEvent(gcal, eventId)
       store.auditLog.push({ at: new Date().toISOString(), action: 'delete', target: eventId, approvedBy })
